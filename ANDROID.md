@@ -16,7 +16,7 @@
 | --- | --- |
 | 全屏 | 直接使用系统 `@android:style/Theme.Material.NoActionBar`（不再自定义主题，避免旧系统解析新属性失败），窗口背景在代码里设为纯黑，页面注入 `fullscreen-mode` 让 `.phone-case` 铺满屏幕 |
 | 沉浸式 | Android 11+ 用 `WindowInsetsController` 隐藏状态栏/导航栏；低版本用 `SYSTEM_UI_FLAG_IMMERSIVE_STICKY`，上滑可临时呼出 |
-| 隐藏顶栏状态栏 | 系统状态栏与导航栏全部隐藏；刘海屏使用 `shortEdges` 并把安全区作为内容内边距，避免被挖孔遮挡 |
+| 隐藏顶栏状态栏 | 系统状态栏与导航栏全部隐藏；刘海屏使用 `LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES` 让窗口延伸到挖孔区，且**不再按刘海安全区加内边距**——页面直接铺满整屏。页面自己画的 44px 假状态栏里时间和电量分列左右，居中挖孔不会挡住它们；若按安全区加 padding，屏幕顶端会露出一条黑边 |
 | 数据导出 | 注入脚本接管 `<a download>` 的 `blob:` / `data:` 下载，分块通过 JS Bridge 写入「下载/VVPhone」；http(s) 直链交给系统 DownloadManager；对导出中的 blob URL 做引用计数保护，页面在 `click()` 后立即 `revokeObjectURL()` 也能完整落盘 |
 | 数据导入 | `WebChromeClient.onShowFileChooser` 打开系统文件选择器，支持 JSON 备份 / 主题预设 / 图片等所有 `<input type="file">` |
 | 数据存储 | 使用 `https://appassets.androidplatform.net` 承载本地资源，IndexedDB 与 localStorage 在稳定 https 源下工作，和浏览器行为一致 |
@@ -28,6 +28,7 @@
 | 安装包命名 | Release 同时上传 `VVPhone.apk` 与 `VVPhone-<run>.apk`；固定名容易被浏览器/CDN 缓存成旧包，排查「装了没变化」时一律用带版本号的文件 |
 | 沉浸式避坑 | `Window.getInsetsController()` 在 `DecorView` 创建前**不是返回 null，而是内部 NPE**（`PhoneWindow#getInsetsController` 直接调 `mDecor.getWindowInsetsController()`）。因此在 `onCreate` 里必须先 `getDecorView()` 强制安装 decor，并整段 `try/catch`；三星 Android 13 曾因这一行必崩 |
 | 软键盘避坑 | 底部 padding **不能加在 WebView 自己身上**：Chromium 的 viewport 取的是 View 的整体尺寸（含 padding），`100vh` 不变、消息输入框照样被盖住。必须让 WebView 的外层容器加 padding，WebView 的测量高度才会真的变小。另在 `index.html` 留了一层 `visualViewport` 兜底：个别 ROM 只报 visual 高度而没压缩 WebView 时，用 `html.vv-keyboard-open body { height: calc(100vh - var(--vv-keyboard)) }` 手动压矮 |
+| 顶栏黑边避坑 | 顶部**绝对不要**按 `displayCutout` / `statusBars` 给容器加 `paddingTop`。padding 加在 WebView 自己身上时 Chromium 不缩 viewport，看不出问题；一旦挪到外层容器，WebView 就真的往下缩，屏幕顶端露出容器黑底，用户会直接说「不全屏了、顶栏成黑条」。要全屏就一路铺满，靠页面内容避开挖孔 |
 
 ## 本地构建（可选，需要 JDK 17 + Android SDK）
 

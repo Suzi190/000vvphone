@@ -12,7 +12,6 @@ import android.content.Intent;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
-import android.graphics.Insets;
 import android.graphics.drawable.ColorDrawable;
 import android.net.Uri;
 import android.os.Build;
@@ -23,7 +22,6 @@ import android.os.Looper;
 import android.provider.MediaStore;
 import android.util.Base64;
 import android.util.Log;
-import android.view.DisplayCutout;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -252,6 +250,9 @@ public class MainActivity extends Activity {
             contentHost = host;
             setContentView(host);
             applyWindowInsets(host);
+            // 换上新的 contentView 之后系统栏有可能被重新显示，这里再收一次，确保一直是沉浸式
+            applyImmersiveMode();
+            host.post(this::applyImmersiveMode);
             BootLog.mark(this, "webview.ready");
             view.loadUrl(START_URL);
             BootLog.mark(this, "loadUrl");
@@ -492,23 +493,16 @@ public class MainActivity extends Activity {
      * @param settled true 表示这是键盘动画结束后的稳定状态，可以在键盘刚弹出时把焦点滚进可视区。
      */
     private void applyViewportInsets(View root, WindowInsets insets, boolean settled) {
-        int top = 0;
         int bottom = 0;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            Insets cutout = insets.getInsets(WindowInsets.Type.displayCutout());
-            Insets ime = insets.getInsets(WindowInsets.Type.ime());
-            top = cutout.top;
-            bottom = ime.bottom;
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            DisplayCutout cutout = insets.getDisplayCutout();
-            if (cutout != null) {
-                top = cutout.getSafeInsetTop();
-            }
-            // API 28 及以下由 adjustResize 真正压缩窗口，这里不再重复扣键盘高度
+            bottom = insets.getInsets(WindowInsets.Type.ime()).bottom;
         }
-
-        if (root.getPaddingTop() != top || root.getPaddingBottom() != bottom) {
-            root.setPadding(0, top, 0, bottom);
+        // 顶部一律不内缩：系统栏已隐藏，页面本来就该铺满整块屏幕。
+        // 这里千万不能按 displayCutout / statusBars 加 paddingTop——padding 加在容器上之后
+        // WebView 会真的往下缩，屏幕顶端立刻露出一条黑边，看起来就是"不全屏了"。
+        // 页面自己画的 44px 假状态栏里，时间和电量分列左右，中间的小挖孔不会挡住它们。
+        if (root.getPaddingTop() != 0 || root.getPaddingBottom() != bottom) {
+            root.setPadding(0, 0, 0, bottom);
         }
 
         if (settled) {
