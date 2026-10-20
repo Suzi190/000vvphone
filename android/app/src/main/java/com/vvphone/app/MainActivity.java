@@ -538,14 +538,19 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void pushKeyboardHeight(int bottom) {
+    private void pushKeyboardHeight(int bottomPx) {
         WebView view = webView;
         if (view == null) {
             return;
         }
         try {
+            // insets 给的是**物理像素**，页面里的 px 是 **CSS 像素**，必须按 density 换算。
+            // 少这一步，高 DPI 屏上键盘高度会被放大 2~3 倍，压得页面内容区变成 0，
+            // 用户看到的就是「键盘上方整片空白」。
+            float density = getResources().getDisplayMetrics().density;
+            int cssPx = (density > 0f) ? Math.round(bottomPx / density) : bottomPx;
             view.evaluateJavascript(
-                    "window.__vvKeyboardHeight&&window.__vvKeyboardHeight(" + bottom + ");", null);
+                    "window.__vvKeyboardHeight&&window.__vvKeyboardHeight(" + cssPx + ");", null);
         } catch (Throwable ignored) {
             // 页面还没加载完成时忽略，页面加载后会有新的 insets 回调补上
         }

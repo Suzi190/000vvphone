@@ -50,9 +50,13 @@
                 }
             }
 
-            // 原生层（MainActivity#onImeInsetChanged）把最终的 IME 高度推过来
+            // 原生层（MainActivity#onImeInsetChanged）把最终的 IME 高度推过来（CSS px）
             window.__vvKeyboardHeight = function (px) {
-                pendingPx = Math.max(0, Math.round(Number(px) || 0));
+                px = Math.max(0, Math.round(Number(px) || 0));
+                // 兜底：无论上游单位算错还是 ROM 报了离谱的值，都不允许把页面内容区压没
+                var limit = Math.round(window.innerHeight * 0.65);
+                if (px > limit) px = limit;
+                pendingPx = px;
                 if (frame) return;
                 frame = window.requestAnimationFrame(function () {
                     frame = 0;
