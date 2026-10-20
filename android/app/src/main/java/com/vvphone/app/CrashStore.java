@@ -52,10 +52,12 @@ final class CrashStore {
         }
         try {
             SharedPreferences prefs = prefs(context);
+            // 必须用 commit()：apply() 是异步落盘，崩溃后进程立刻被系统杀死，
+            // 计数经常写不进去（这次实测 last-crash.txt 有内容但「崩溃次数: 0」）。
             prefs.edit()
                     .putInt(KEY_COUNT, prefs.getInt(KEY_COUNT, 0) + 1)
                     .putLong(KEY_LAST_AT, System.currentTimeMillis())
-                    .apply();
+                    .commit();
         } catch (Throwable ignored) {
             // 同上
         }
@@ -107,7 +109,7 @@ final class CrashStore {
 
     static void clear(Context context) {
         try {
-            prefs(context).edit().clear().apply();
+            prefs(context).edit().clear().commit();
         } catch (Throwable ignored) {
             // 忽略
         }

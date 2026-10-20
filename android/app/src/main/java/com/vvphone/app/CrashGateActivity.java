@@ -100,7 +100,8 @@ public class CrashGateActivity extends Activity {
             root.addView(title);
 
             TextView hint = new TextView(this);
-            hint.setText("这次先不加载页面，把上次启动的最后一步和崩溃信息留在下面。\n点「复制信息」发给开发者，点「清空记录并重试」可再试一次。");
+            hint.setText("这次先不加载页面，把上次启动的最后一步和崩溃信息留在下面。\n"
+                    + "刚更新过版本的话，直接点「清空记录并重试」就能进入；否则点「复制信息」发给开发者。");
             hint.setTextColor(Color.parseColor("#8A8A99"));
             hint.setTextSize(12f);
             hint.setPadding(0, dp(8), 0, dp(8));

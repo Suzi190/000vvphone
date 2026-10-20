@@ -90,11 +90,12 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        BootLog.mark(this, "main.onCreate");
 
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         setupWindow();
         applyCutoutMode();
-        BootLog.mark(this, "main.onCreate");
+        BootLog.mark(this, "main.window");
 
         String recentCrash = CrashStore.readLastCrash(this);
         int crashCount = CrashStore.crashCount(this);
@@ -333,30 +334,47 @@ public class MainActivity extends Activity {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         window.setBackgroundDrawable(new ColorDrawable(Color.BLACK));
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            window.setDecorFitsSystemWindows(false);
+            try {
+                window.setDecorFitsSystemWindows(false);
+            } catch (Throwable ignored) {
+                // 部分 ROM 在 DecorView 创建前会抛异常，忽略即可
+            }
         }
         applyImmersiveMode();
     }
 
-    /** 全屏沉浸式：隐藏系统状态栏与导航栏，上滑可临时呼出。 */
+    /**
+     * 全屏沉浸式：隐藏系统状态栏与导航栏，上滑可临时呼出。
+     *
+     * 注意：{@code Window.getInsetsController()} 在 DecorView 尚未创建时会直接抛
+     * NullPointerException（AOSP PhoneWindow#getInsetsController 写的是
+     * {@code mDecor.getWindowInsetsController()}，mDecor 为 null 时并不是返回 null）。
+     * onCreate 里 setContentView 之前就是这种状态，三星 Android 13 上实测必崩，
+     * 所以这里先 getDecorView() 强制安装 decor，并整段兜住 Throwable。
+     */
     private void applyImmersiveMode() {
         Window window = getWindow();
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            window.setDecorFitsSystemWindows(false);
-            WindowInsetsController controller = window.getInsetsController();
-            if (controller != null) {
-                controller.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
-                controller.setSystemBarsBehavior(
-                        WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                window.getDecorView();
+                window.setDecorFitsSystemWindows(false);
+                WindowInsetsController controller = window.getInsetsController();
+                if (controller != null) {
+                    controller.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+                    controller.setSystemBarsBehavior(
+                            WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                }
+            } else {
+                window.getDecorView().setSystemUiVisibility(
+                        View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                                | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                                | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                                | View.SYSTEM_UI_FLAG_FULLSCREEN
+                                | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
             }
-        } else {
-            window.getDecorView().setSystemUiVisibility(
-                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                            | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                            | View.SYSTEM_UI_FLAG_FULLSCREEN
-                            | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+        } catch (Throwable ignored) {
+            // 隐藏系统栏失败不影响启动，onResume / onWindowFocusChanged 还会再试一次
         }
     }
 

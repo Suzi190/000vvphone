@@ -91,6 +91,11 @@ jobs:
             请下载 `VVPhone-${{ github.run_number }}.apk` —— 文件名自带版本号，不会被浏览器/CDN 缓存成旧包。
             `VVPhone.apk` 也指向最新构建，但缓存较顽固，遇到「怎么装都还是老问题」时请改用带版本号的文件。
 
+            本版修复：启动时隐藏系统栏在 DecorView 创建之前调用 `Window.getInsetsController()` 导致的
+            `NullPointerException`（三星 Android 13 / API 33 上必崩，日志为
+            `PhoneWindow.getInsetsController` → `MainActivity.applyImmersiveMode`）。
+            覆盖安装即可保留数据；若上次崩溃记录还在，进入闸门页点「清空记录并重试」。
+
             - 启动闸门：连续崩溃时显示可复制的崩溃堆栈与启动轨迹，主界面不再无声闪退
             - 启动页显示版本号 / Android 版本 / WebView 版本，可直接确认装的是新包
             - 全屏沉浸式：隐藏系统状态栏与导航栏
