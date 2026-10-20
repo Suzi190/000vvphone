@@ -7853,10 +7853,31 @@ input:checked + .slider:before { transform: translateX(22px); }
 #chat-bilingual-language-group[hidden] { display: none; }
 
 /* --- 软键盘避让（Android WebView） ---
-   完全由原生层处理：给 WebView 的外层容器加底部 padding，WebView 的测量高度真的变矮，
-   页面里的 100vh 随之变小，底部输入框自然上移。
+   原生层把 IME 高度推给页面（一次性给最终值），这里只压缩 `.phone-case` 的底部内边距：
+   页面内容整体让出键盘高度，而 **WebView 自身的尺寸始终不变**。
 
-   ⚠️ 不要再在这里压缩 body 高度。body 是 flex 居中布局，height 变小会让 .phone-case
-   上下同时收缩：屏幕上立刻露出 body 的黑底，输入框看起来一窜一窜地跳。
-   之前 index.html 里的 vv-keyboard-bridge 就是这么干的，已移除。 */
+   ⚠️ 绝对不要再改 WebView / body 的高度（改容器 padding、改 body height 都不行）：
+   WebView 一 resize，Chromium 就要重建绘制 surface，键盘动画期间每帧都会掉帧、
+   露出整片黑帧，同时输入框和键盘永远对不齐——用户看到的就是「上下跳 + 黑边」。
+
+   `.phone-case` 的内边距区露的是它自己的底色（默认 #000），所以这里换成 `--vv-kb-bg`
+   （由页面按当前屏幕底色计算，取不到就退成白色），动画期间那几帧才不会发黑。 */
+html.vv-keyboard-open .phone-case {
+    padding-bottom: var(--vv-kb, 0px);
+    background-color: var(--vv-kb-bg, #fff);
+    /* 只给内边距一次平滑过渡（原生层已经把「每帧跟随」换成「一次性给最终高度」）。
+       注意不能用 transition: none：键盘还在上升时内容突然整体跳一格，观感就是「输入框跳了一下」。
+       关闭键盘时 class 被移除，padding 会立刻归零（见文件末尾 .phone-case 的 transition 覆盖），
+       内容先落满全屏，键盘再滑下去，全程都不会露底色。 */
+    transition: padding-bottom 150ms ease-out;
+}
+
+/* `.phone-case` 原本是 transition: all .3s，会把底色也一起渐变：
+   键盘收起时能看到一条由白渐变成黑的带子。这里把 background 从过渡里排除，
+   宽度/高度/圆角/阴影的全屏切换动画照旧保留。 */
+.phone-case {
+    transition: width .3s ease, height .3s ease, border-radius .3s ease,
+        box-shadow .3s ease, border-color .3s ease, border-width .3s ease;
+}
+
 

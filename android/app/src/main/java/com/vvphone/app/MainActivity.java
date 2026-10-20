@@ -19,7 +19,6 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.SystemClock;
 import android.provider.MediaStore;
 import android.util.Base64;
 import android.util.Log;
@@ -30,7 +29,6 @@ import android.view.ViewConfiguration;
 import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowInsets;
-import android.view.WindowInsetsAnimation;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.webkit.ConsoleMessage;
@@ -59,7 +57,6 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -87,16 +84,28 @@ public class MainActivity extends Activity {
     /** 上一次「稳定」状态下应用到底部的键盘/刘海高度，用来判断键盘是不是刚弹出。 */
     private int appliedBottomInset;
 
-    /** 键盘动画是否正在进行：为 true 时底部 padding 由 onProgress 逐帧驱动，insets 回调不要插手。 */
-    private boolean imeAnimating;
+    /** 最近一次收到的键盘高度（用来收尾补一次精确值）。 */
+    private int latestKeyboardBottom;
 
-    /** 键盘动画开始那一刻容器的底部 padding，逐帧插值以它为起点。 */
-    private int imeAnimationStartBottom;
+    /** 最近一次已经推给页面的键盘高度（用来合并中间帧，少跨进程调 JS）。 */
+    private int pushedKeyboardBottom;
 
-    /** 键盘动画开始的时刻：万一 ROM 没回调 onEnd，超时后自动恢复成直接套用 insets。 */
-    private long imeAnimationStartAtMs;
+    /** 键盘收起时的容器高度（= 真全屏高度），用来识别「系统自己 resize 了窗口」的 ROM。 */
+    private int fullRootHeight;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    /** 把「最终」键盘高度推给页面（中间帧一律不推，见 onImeInsetChanged 里的说明）。 */
+    private final Runnable syncKeyboardTask = () -> {
+        int bottom = latestKeyboardBottom;
+        if (bottom > 0 && contentHost != null && fullRootHeight > 0
+                && contentHost.getHeight() < fullRootHeight - 60) {
+            // 窗口真的被系统缩矮了（系统已经避让过），页面再让位就成了双重避让
+            bottom = 0;
+        }
+        pushedKeyboardBottom = bottom;
+        pushKeyboardHeight(bottom);
+    };
 
     /** 键盘稳定后把焦点输入框滚进视野（做了去抖，避免动画期间反复滚动导致页面上下跳）。 */
     private final Runnable scrollIntoViewTask = this::scrollFocusedFieldIntoView;
@@ -473,72 +482,29 @@ public class MainActivity extends Activity {
 
     /**
      * 全屏沉浸式下系统不会替我们缩小窗口，软键盘只以 IME inset 的形式上报。
-     * 这里把 inset 转成「根容器的 padding」：WebView 的布局高度因此真的变矮，
-     * 页面里的 100vh / 底栏 flex 布局才会跟着上移，输入框不再被键盘盖住。
+     *
+     * 这里**不再改 WebView 的尺寸**。改尺寸会让 Chromium 重建绘制 surface：键盘动画期间每帧 resize
+     * 都会掉帧、露黑帧，而且键盘窗口自己的动画曲线和 insets 动画曲线在不少 ROM（三星很典型）上是两套，
+     * 内容和键盘永远对不齐——用户看到的就是「输入框上下跳 + 露黑边」，怎么调缓动都没用。
+     *
+     * 现在只把键盘高度推给页面（`--vv-kb`），由页面压缩 `.phone-case` 的底部内边距：
+     * WebView 尺寸恒定（无 surface 重建、无黑帧），页面底部让出键盘高度，输入框一样不会被盖住。
      */
     private void applyWindowInsets(View root) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            try {
-                root.setWindowInsetsAnimationCallback(new WindowInsetsAnimation.Callback(
-                        WindowInsetsAnimation.Callback.DISPATCH_MODE_STOP) {
-                    @Override
-                    public WindowInsetsAnimation.Bounds onStart(WindowInsetsAnimation animation,
-                                                                WindowInsetsAnimation.Bounds bounds) {
-                        if ((animation.getTypeMask() & WindowInsets.Type.ime()) != 0) {
-                            imeAnimating = true;
-                            imeAnimationStartAtMs = SystemClock.uptimeMillis();
-                            imeAnimationStartBottom = root.getPaddingBottom();
-                        }
-                        return bounds;
-                    }
-
-                    @Override
-                    public WindowInsets onProgress(WindowInsets insets, List<WindowInsetsAnimation> running) {
-                        for (int i = 0; i < running.size(); i++) {
-                            WindowInsetsAnimation animation = running.get(i);
-                            if ((animation.getTypeMask() & WindowInsets.Type.ime()) == 0) {
-                                continue;
-                            }
-                            int frame = insets.getInsets(WindowInsets.Type.ime()).bottom;
-                            // 内容必须比键盘「晚到位」，否则中间会露出一条容器底色（原来是黑边）。
-                            // 弹出用 ease-in（内容上移慢于键盘上升），键盘顶边会一路盖住还没被内容填满的底部；
-                            // 收起用 ease-out（内容先落下去），同样不会在键盘上方留出空隙。
-                            // 之前是线性跟随 insets 动画，在键盘窗口自身动画比 insets 慢的 ROM（三星很典型）上，
-                            // 内容会一马当先冲上去，键盘追不上，中间就是一条黑边。
-                            float t = animation.getInterpolatedFraction();
-                            boolean opening = frame >= imeAnimationStartBottom;
-                            float eased = opening
-                                    ? t * t
-                                    : 1f - (1f - t) * (1f - t);
-                            setBottomInset(root, Math.round(imeAnimationStartBottom
-                                    + (frame - imeAnimationStartBottom) * eased));
-                            return insets;
-                        }
-                        return insets;
-                    }
-
-                    @Override
-                    public void onEnd(WindowInsetsAnimation animation) {
-                        if ((animation.getTypeMask() & WindowInsets.Type.ime()) == 0) {
-                            return;
-                        }
-                        imeAnimating = false;
-                        imeAnimationStartAtMs = 0L;
-                        WindowInsets rootInsets = root.getRootWindowInsets();
-                        if (rootInsets != null) {
-                            // 动画收尾一律回到系统给的最终值，避免插值残留导致输入框差几个像素
-                            applyViewportInsets(root, rootInsets, true);
-                        }
-                    }
-                });
-            } catch (Throwable ignored) {
-                // 个别 ROM 不支持动画回调，退化成 insets 变化时直接跳变
-            }
-        }
-
         root.setOnApplyWindowInsetsListener((v, insets) -> {
-            applyViewportInsets(v, insets, true);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                int bottom = insets.getInsets(WindowInsets.Type.ime()).bottom;
+                if (bottom > 0) {
+                    // 防御：个别 ROM 即使 setDecorFitsSystemWindows(false) 也会为键盘把窗口缩矮。
+                    // 这时候系统自己已经避让过了，再让页面压内边距就是双重避让——输入框会跑到屏幕中间。
+                    if (fullRootHeight > 0 && v.getHeight() < fullRootHeight - 60) {
+                        bottom = 0;
+                    }
+                } else {
+                    // 键盘收起时窗口才是真正的全屏高度，记下来给上面做参照
+                    fullRootHeight = Math.max(fullRootHeight, v.getHeight());
+                }
+                onImeInsetChanged(bottom);
                 // 自己消费掉，避免 WebView 内部再对 IME inset 做一次滚动/缩放
                 return WindowInsets.CONSUMED;
             }
@@ -547,46 +513,41 @@ public class MainActivity extends Activity {
         root.requestApplyInsets();
     }
 
-    /**
-     * @param settled true 表示这是键盘动画结束后的稳定状态，可以在键盘刚弹出时把焦点滚进可视区。
-     */
-    private void applyViewportInsets(View root, WindowInsets insets, boolean settled) {
-        int bottom = 0;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            bottom = insets.getInsets(WindowInsets.Type.ime()).bottom;
-        }
-        // 键盘动画进行中：底部 padding 由 onProgress 的缓动曲线逐帧驱动。
-        // 这里如果也直接套用系统插值，两套值会互相覆盖，表现出来就是输入框「一窜一窜」地上下跳。
-        if (imeAnimating && imeAnimationStartAtMs > 0L
-                && SystemClock.uptimeMillis() - imeAnimationStartAtMs > 700L) {
-            // 保险：个别 ROM 不回调 onEnd，超时后不再等逐帧回调，直接按系统值落位
-            imeAnimating = false;
-            imeAnimationStartAtMs = 0L;
-        }
-        if (!imeAnimating) {
-            setBottomInset(root, bottom);
+    private void onImeInsetChanged(int bottom) {
+        latestKeyboardBottom = bottom;
+        boolean wasShown = appliedBottomInset > 0;
+        appliedBottomInset = bottom;
+
+        if (bottom > 0 && !wasShown) {
+            // 键盘刚弹出：等页面把内边距算完再滚，否则测量还是旧的
+            mainHandler.removeCallbacks(scrollIntoViewTask);
+            mainHandler.postDelayed(scrollIntoViewTask, 260);
         }
 
-        if (settled && !imeAnimating) {
-            boolean keyboardJustShown = bottom > appliedBottomInset;
-            appliedBottomInset = bottom;
-            if (keyboardJustShown) {
-                // 去抖：动画/布局收尾期间 insets 可能连报几次，每次都滚一下页面就会上下跳
-                mainHandler.removeCallbacks(scrollIntoViewTask);
-                mainHandler.postDelayed(scrollIntoViewTask, 120);
-            }
+        // 关键：**只推一次「最终高度」**，绝对不要跟着 insets 一帧一帧地改页面。
+        // 逐帧改内边距 = 逐帧整页重新排版，遇上 ROM 上报的 inset 来回抖（很多国产 ROM 都会），
+        // 输入框就会一窜一窜地上下跳。这里等 insets 稳定下来再一次性到位：内容只动一次。
+        //  · 收起（bottom==0）用 30ms 去抖：个别 ROM 收起过程中会瞬时上报 0，立即跟随会抖一下；
+        //  · 弹出 / 高度变化（切换输入法、悬浮键盘）用 90ms：等键盘动画过半再让位，底部始终被键盘盖着，
+        //    不会在键盘还没升起来的时候先露出一条底色。
+        boolean closing = bottom == 0;
+        boolean opening = !wasShown;
+        if (closing || opening || Math.abs(bottom - pushedKeyboardBottom) >= 24) {
+            mainHandler.removeCallbacks(syncKeyboardTask);
+            mainHandler.postDelayed(syncKeyboardTask, closing ? 30 : 90);
         }
     }
 
-    /**
-     * 只改容器底部 padding：顶部一律不内缩。
-     * 这里千万不能按 displayCutout / statusBars 加 paddingTop——padding 加在容器上之后
-     * WebView 会真的往下缩，屏幕顶端立刻露出一条黑边，看起来就是"不全屏了"。
-     * 页面自己画的 44px 假状态栏里，时间和电量分列左右，中间的小挖孔不会挡住它们。
-     */
-    private void setBottomInset(View root, int bottom) {
-        if (root.getPaddingTop() != 0 || root.getPaddingBottom() != bottom) {
-            root.setPadding(0, 0, 0, bottom);
+    private void pushKeyboardHeight(int bottom) {
+        WebView view = webView;
+        if (view == null) {
+            return;
+        }
+        try {
+            view.evaluateJavascript(
+                    "window.__vvKeyboardHeight&&window.__vvKeyboardHeight(" + bottom + ");", null);
+        } catch (Throwable ignored) {
+            // 页面还没加载完成时忽略，页面加载后会有新的 insets 回调补上
         }
     }
 
@@ -678,6 +639,10 @@ public class MainActivity extends Activity {
             } catch (Throwable error) {
                 Log.w(TAG, "注入脚本失败", error);
             }
+            // 页面可能在键盘已经弹出的状态下重新加载，补推一次当前高度，
+            // 否则新页面拿不到 --vv-kb，输入框会直接被键盘盖住
+            pushedKeyboardBottom = -1;
+            pushKeyboardHeight(latestKeyboardBottom);
         }
 
         /**

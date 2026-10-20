@@ -32,6 +32,15 @@
             </intent-filter>
         </activity>
 
+        <!--
+            windowSoftInputMode 用 adjustResize 而不是 adjustNothing：
+            · Android 11+（API 30+）MainActivity 会 setDecorFitsSystemWindows(false)，
+              系统这时根本不会为键盘 resize 窗口，IME 只以 WindowInsets.Type.ime() 上报，
+              由 MainActivity 把高度推给页面（CSS 变量 vv-kb）来避让，WebView 尺寸恒定、没有黑帧；
+            · Android 7~10（API 24~29）拿不到逐帧 IME inset，只能靠系统 resize 窗口，
+              这正是这些老系统上的原生行为，输入框不会被键盘盖住。
+            用 adjustNothing 会让老系统上键盘直接盖住输入框，所以不能这么写。
+        -->
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode|density"
@@ -39,7 +48,7 @@
             android:launchMode="singleTask"
             android:screenOrientation="portrait"
             android:theme="@android:style/Theme.Material.NoActionBar"
-            android:windowSoftInputMode="adjustNothing" />
+            android:windowSoftInputMode="adjustResize" />
     </application>
 
 </manifest>

@@ -16,14 +16,67 @@
     <style id="dynamic-chat-theme"></style>
 <link rel="manifest" href="manifest.json">
     <!--
-        软键盘避让完全交给原生层：Android 外壳给「WebView 外层容器」加底部 padding，
-        WebView 的真实高度会跟着键盘变化，页面里的 100vh 自动缩小，底栏和输入框随之上移。
+        软键盘避让：Android 外壳把 IME 高度推给页面（--vv-kb），页面只压缩 .phone-case 的
+        底部内边距。WebView 自身的尺寸始终不变——改尺寸会让 Chromium 重建绘制 surface，
+        键盘动画期间必然黑帧 + 上下跳（1.0.9 ~ 1.0.11 就是栽在这里）。
 
-        这里曾经用 visualViewport 做兜底（给 <html> 加 .vv-keyboard-open 再压一次 body 高度），
-        结果和原生 padding 叠成了双重压缩；而且 body 是 flex 居中布局，body 变矮后 .phone-case
-        会上下同时收缩，屏幕上立刻露出黑边、输入框一窜一窜地跳。
-        原生方案已经在真机验证有效，兜底反而帮倒忙，所以整段移除。
+        普通浏览器（没有 VVAndroid 桥）里退化成 visualViewport 兜底。
     -->
+    <script id="vv-keyboard-bridge">
+        (function () {
+            var root = document.documentElement;
+            var frame = 0;
+            var pendingPx = 0;
+            var appliedPx = -1;
+
+            function bottomColor() {
+                var screen = document.querySelector('.screen.active');
+                if (!screen) return '';
+                var bg = window.getComputedStyle(screen).backgroundColor;
+                if (!bg || bg === 'transparent' || bg === 'rgba(0, 0, 0, 0)') return '';
+                return bg;
+            }
+
+            function paint(px) {
+                if (px === appliedPx) return;
+                appliedPx = px;
+                if (px > 0) {
+                    root.style.setProperty('--vv-kb', px + 'px');
+                    root.style.setProperty('--vv-kb-bg', bottomColor() || '#ffffff');
+                    root.classList.add('vv-keyboard-open');
+                } else {
+                    root.style.setProperty('--vv-kb', '0px');
+                    root.classList.remove('vv-keyboard-open');
+                }
+            }
+
+            // 原生层（MainActivity#onImeInsetChanged）把最终的 IME 高度推过来
+            window.__vvKeyboardHeight = function (px) {
+                pendingPx = Math.max(0, Math.round(Number(px) || 0));
+                if (frame) return;
+                frame = window.requestAnimationFrame(function () {
+                    frame = 0;
+                    paint(pendingPx);
+                });
+            };
+
+            // 没有原生桥（普通浏览器 / 其它套壳）时，用 visualViewport 兜底
+            var vv = window.visualViewport;
+            if (!vv || window.VVAndroid) return;
+            var timer = 0;
+            function fallback() {
+                window.clearTimeout(timer);
+                timer = window.setTimeout(function () {
+                    var keyboard = Math.round(window.innerHeight - vv.height);
+                    paint(keyboard > 80 ? keyboard : 0);
+                }, 120);
+            }
+            vv.addEventListener('resize', fallback);
+            vv.addEventListener('scroll', fallback);
+            window.addEventListener('resize', fallback);
+            window.addEventListener('orientationchange', fallback);
+        })();
+    </script>
 </head>
 <body>
     <!-- 数据加载遮罩 -->
