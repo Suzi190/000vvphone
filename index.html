@@ -64,6 +64,41 @@
                 });
             };
 
+            // 兜底通道：输入框获得焦点后，直接向原生**同步索取**当前键盘高度。
+            // 主通道是原生 evaluateJavascript 推送，但个别机型上 insets 回调不来、
+            // 或推送发生在页面 JS 就绪之前，页面就一直拿不到值，输入框被键盘盖住。
+            // 同步读取不依赖推送时机，只要原生知道高度就一定拿得到。
+            function isEditable(el) {
+                if (!el) return false;
+                var tag = (el.tagName || '').toLowerCase();
+                return tag === 'input' || tag === 'textarea' || el.isContentEditable === true;
+            }
+
+            function pullFromNative(allowZero) {
+                try {
+                    if (!window.VVAndroid || typeof VVAndroid.getKeyboardHeight !== 'function') return;
+                    var px = Number(VVAndroid.getKeyboardHeight()) || 0;
+                    // 焦点在输入框里时不要用 0 把让位清掉：键盘刚弹出那几百毫秒原生可能还是 0
+                    if (px === 0 && !allowZero && isEditable(document.activeElement)) return;
+                    window.__vvKeyboardHeight(px);
+                } catch (e) {
+                    // 桥不可用就只依赖推送
+                }
+            }
+
+            if (window.VVAndroid) {
+                document.addEventListener('focusin', function () {
+                    [180, 380, 650, 1000].forEach(function (delay) {
+                        window.setTimeout(function () { pullFromNative(false); }, delay);
+                    });
+                }, true);
+                document.addEventListener('focusout', function () {
+                    [150, 450, 900].forEach(function (delay) {
+                        window.setTimeout(function () { pullFromNative(true); }, delay);
+                    });
+                }, true);
+            }
+
             // 没有原生桥（普通浏览器 / 其它套壳）时，用 visualViewport 兜底
             var vv = window.visualViewport;
             if (!vv || window.VVAndroid) return;

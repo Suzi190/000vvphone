@@ -12,6 +12,7 @@ import android.content.Intent;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.graphics.Rect;
 import android.graphics.drawable.ColorDrawable;
 import android.net.Uri;
 import android.os.Build;
@@ -97,15 +98,57 @@ public class MainActivity extends Activity {
 
     /** 把「最终」键盘高度推给页面（中间帧一律不推，见 onImeInsetChanged 里的说明）。 */
     private final Runnable syncKeyboardTask = () -> {
+        pushedKeyboardBottom = latestKeyboardBottom;
+        pushKeyboardHeight(currentKeyboardCssPx());
+    };
+
+    /**
+     * insets 给的是**物理像素**，页面里的 px 是 **CSS 像素**（WebView 里 1 CSS px = 1dp），
+     * 必须按 density 换算。少了这一步，高 DPI 屏上键盘高度会被放大 2~3 倍，
+     * `padding-bottom` 直接把内容区压成 0，用户看到的就是「键盘上方整片空白」。
+     */
+    private int keyboardCssPx(int physicalPx) {
+        if (physicalPx <= 0) {
+            return 0;
+        }
+        float density = getResources().getDisplayMetrics().density;
+        return (density > 0f) ? Math.round(physicalPx / density) : physicalPx;
+    }
+
+    /** 页面此刻应该让出多少 CSS 像素（含「系统已经自己缩了窗口」的判断）。 */
+    private int currentKeyboardCssPx() {
         int bottom = latestKeyboardBottom;
         if (bottom > 0 && contentHost != null && fullRootHeight > 0
                 && contentHost.getHeight() < fullRootHeight - 60) {
             // 窗口真的被系统缩矮了（系统已经避让过），页面再让位就成了双重避让
-            bottom = 0;
+            return 0;
         }
-        pushedKeyboardBottom = bottom;
-        pushKeyboardHeight(bottom);
-    };
+        return keyboardCssPx(bottom);
+    }
+
+    /**
+     * 少数 ROM 不发（或发错）ime inset：用「窗口可见区域底边距」再量一次（物理像素）。
+     * 只认超过 120dp 的值，避免把导航栏高度当成键盘。
+     */
+    private int measureKeyboardGapPx() {
+        try {
+            View root = (contentHost != null) ? contentHost : getWindow().getDecorView();
+            Rect visible = new Rect();
+            root.getWindowVisibleDisplayFrame(visible);
+            int gap = root.getRootView().getHeight() - visible.bottom;
+            if (gap > dp(120)) {
+                return gap;
+            }
+        } catch (Throwable ignored) {
+            // 量不到就返回 0，交给 ime inset 那条路
+        }
+        return 0;
+    }
+
+    /** 同 {@link #measureKeyboardGapPx()}，换算成页面用的 CSS 像素。 */
+    private int measureKeyboardGapCssPx() {
+        return keyboardCssPx(measureKeyboardGapPx());
+    }
 
     /** 键盘稳定后把焦点输入框滚进视野（做了去抖，避免动画期间反复滚动导致页面上下跳）。 */
     private final Runnable scrollIntoViewTask = this::scrollFocusedFieldIntoView;
@@ -495,6 +538,12 @@ public class MainActivity extends Activity {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 int bottom = insets.getInsets(WindowInsets.Type.ime()).bottom;
                 if (bottom > 0) {
+                    // 兜底校正：个别 ROM 的 ime inset 偏小（不含键盘工具栏），
+                    // 这时用「窗口可见区域底边距」补一次；差值不到 24dp 就不动，避免来回抖。
+                    int gapPx = measureKeyboardGapPx();
+                    if (gapPx > bottom + dp(24)) {
+                        bottom = gapPx;
+                    }
                     // 防御：个别 ROM 即使 setDecorFitsSystemWindows(false) 也会为键盘把窗口缩矮。
                     // 这时候系统自己已经避让过了，再让页面压内边距就是双重避让——输入框会跑到屏幕中间。
                     if (fullRootHeight > 0 && v.getHeight() < fullRootHeight - 60) {
@@ -538,21 +587,16 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void pushKeyboardHeight(int bottomPx) {
+    private void pushKeyboardHeight(int cssPx) {
         WebView view = webView;
         if (view == null) {
             return;
         }
         try {
-            // insets 给的是**物理像素**，页面里的 px 是 **CSS 像素**，必须按 density 换算。
-            // 少这一步，高 DPI 屏上键盘高度会被放大 2~3 倍，压得页面内容区变成 0，
-            // 用户看到的就是「键盘上方整片空白」。
-            float density = getResources().getDisplayMetrics().density;
-            int cssPx = (density > 0f) ? Math.round(bottomPx / density) : bottomPx;
             view.evaluateJavascript(
                     "window.__vvKeyboardHeight&&window.__vvKeyboardHeight(" + cssPx + ");", null);
         } catch (Throwable ignored) {
-            // 页面还没加载完成时忽略，页面加载后会有新的 insets 回调补上
+            // 页面还没加载完成时忽略；页面加载后 onPageFinished 会补推，页面 focusin 时也会主动来要
         }
     }
 
@@ -647,7 +691,7 @@ public class MainActivity extends Activity {
             // 页面可能在键盘已经弹出的状态下重新加载，补推一次当前高度，
             // 否则新页面拿不到 --vv-kb，输入框会直接被键盘盖住
             pushedKeyboardBottom = -1;
-            pushKeyboardHeight(latestKeyboardBottom);
+            pushKeyboardHeight(currentKeyboardCssPx());
         }
 
         /**
@@ -897,6 +941,23 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void toast(String message) {
             showToast(message);
+        }
+
+        /**
+         * 页面主动索取当前键盘高度（CSS px）。
+         *
+         * 为什么需要这个：唯一的「推送」通道是 {@code evaluateJavascript}，个别机型/ROM 上
+         * insets 回调可能压根不来、或者推送发生在页面 JS 上下文还没就绪的时候，页面就一直
+         * 拿不到值，输入框被键盘盖住。页面在输入框获得焦点时会同步调用这里，
+         * 即使推送全丢也能拿到正确高度（insets 没上报时再用可见区域兜底量一次）。
+         */
+        @JavascriptInterface
+        public int getKeyboardHeight() {
+            int cssPx = currentKeyboardCssPx();
+            if (cssPx == 0) {
+                cssPx = measureKeyboardGapCssPx();
+            }
+            return cssPx;
         }
     }
     private File resolveLegacyDownloadDir() {
