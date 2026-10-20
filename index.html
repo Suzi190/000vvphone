@@ -15,35 +15,15 @@
     <style id="custom-font-style"></style>
     <style id="dynamic-chat-theme"></style>
 <link rel="manifest" href="manifest.json">
-    <!-- 软键盘兜底：原生层没把 WebView 压矮时，用 visualViewport 压缩 body 高度（见 style.css 末尾） -->
-    <script id="vv-keyboard-bridge">
-        (function () {
-            var vv = window.visualViewport;
-            if (!vv) return;
-            var pending = 0;
-            function apply() {
-                var root = document.documentElement;
-                var keyboard = Math.round(window.innerHeight - vv.height);
-                if (keyboard > 80) {
-                    root.style.setProperty('--vv-keyboard', keyboard + 'px');
-                    root.classList.add('vv-keyboard-open');
-                } else {
-                    root.style.removeProperty('--vv-keyboard');
-                    root.classList.remove('vv-keyboard-open');
-                }
-            }
-            function schedule() {
-                // 防抖：键盘动画过程中 visualViewport 尺寸每帧都变，若逐帧套用会和原生层的
-                // padding 动画互相打架（内容被压两次）。等尺寸稳定后再判断。
-                window.clearTimeout(pending);
-                pending = window.setTimeout(apply, 180);
-            }
-            vv.addEventListener('resize', schedule);
-            vv.addEventListener('scroll', schedule);
-            window.addEventListener('resize', schedule);
-            window.addEventListener('orientationchange', schedule);
-        })();
-    </script>
+    <!--
+        软键盘避让完全交给原生层：Android 外壳给「WebView 外层容器」加底部 padding，
+        WebView 的真实高度会跟着键盘变化，页面里的 100vh 自动缩小，底栏和输入框随之上移。
+
+        这里曾经用 visualViewport 做兜底（给 <html> 加 .vv-keyboard-open 再压一次 body 高度），
+        结果和原生 padding 叠成了双重压缩；而且 body 是 flex 居中布局，body 变矮后 .phone-case
+        会上下同时收缩，屏幕上立刻露出黑边、输入框一窜一窜地跳。
+        原生方案已经在真机验证有效，兜底反而帮倒忙，所以整段移除。
+    -->
 </head>
 <body>
     <!-- 数据加载遮罩 -->

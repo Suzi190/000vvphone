@@ -7852,11 +7852,11 @@ input:checked + .slider:before { transform: translateX(22px); }
 }
 #chat-bilingual-language-group[hidden] { display: none; }
 
-/* --- 软键盘兜底（Android WebView） ---
-   正常情况下由原生层把键盘高度换算成 WebView 容器的底部 padding，WebView 会真正变矮，
+/* --- 软键盘避让（Android WebView） ---
+   完全由原生层处理：给 WebView 的外层容器加底部 padding，WebView 的测量高度真的变矮，
    页面里的 100vh 随之变小，底部输入框自然上移。
-   若个别 ROM 只上报 visualViewport、不压缩 WebView，则由 index.html 里的
-   vv-keyboard-bridge 给 <html> 加上 .vv-keyboard-open，在这里把可视高度压下来。 */
-html.vv-keyboard-open body {
-    height: calc(100vh - var(--vv-keyboard, 0px));
-}
+
+   ⚠️ 不要再在这里压缩 body 高度。body 是 flex 居中布局，height 变小会让 .phone-case
+   上下同时收缩：屏幕上立刻露出 body 的黑底，输入框看起来一窜一窜地跳。
+   之前 index.html 里的 vv-keyboard-bridge 就是这么干的，已移除。 */
+

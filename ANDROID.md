@@ -20,14 +20,14 @@
 | 数据导出 | 注入脚本接管 `<a download>` 的 `blob:` / `data:` 下载，分块通过 JS Bridge 写入「下载/VVPhone」；http(s) 直链交给系统 DownloadManager；对导出中的 blob URL 做引用计数保护，页面在 `click()` 后立即 `revokeObjectURL()` 也能完整落盘 |
 | 数据导入 | `WebChromeClient.onShowFileChooser` 打开系统文件选择器，支持 JSON 备份 / 主题预设 / 图片等所有 `<input type="file">` |
 | 数据存储 | 使用 `https://appassets.androidplatform.net` 承载本地资源，IndexedDB 与 localStorage 在稳定 https 源下工作，和浏览器行为一致 |
-| 软键盘 | 监听 IME insets，把键盘高度加到**包住 WebView 的容器**的底部 padding 上：WebView 布局高度真的变矮，页面 `100vh` 跟着缩小，聊天输入框不会被键盘遮住；API 30+ 用 `WindowInsetsAnimation.Callback` 让 padding 跟随键盘动画逐帧变化，键盘一弹出再把焦点输入框 `scrollIntoView({block:'nearest'})` 滚进可视区 |
+| 软键盘 | 监听 IME insets，把键盘高度加到**包住 WebView 的容器**的底部 padding 上：WebView 布局高度真的变矮，页面 `100vh` 跟着缩小，聊天输入框不会被键盘遮住；API 30+ 用 `WindowInsetsAnimation.Callback`（`DISPATCH_MODE_STOP`，不把动画再下发给 WebView）逐帧驱动 padding，并做了**方向性缓动**：弹出用 ease-in（内容上移慢于键盘上升）、收起用 ease-out（内容先落回去），保证容器底部始终被键盘或页面内容盖住；键盘稳定后（去抖 120ms）才把焦点输入框 `scrollIntoView({block:'nearest'})` 滚进可视区 |
 | 返回键 | 逐层返回：关闭弹层 → 退出聊天回到应用 → 从其他应用回桌面 → 已在桌面时退到后台 |
 | 滑动手势 | 从屏幕左边缘向右滑动即返回上一页：起手点须在边缘 28dp 内，拖动时页面跟手平移，超过 72dp 触发，未达阈值自动弹回；与返回键共用同一套逻辑 |
 | 崩溃防护 | 启动入口是极简的 `CrashGateActivity` 闸门：上次崩溃过、或上次启动没走完（原生层崩溃抓不到 Java 堆栈）时，它直接显示可复制的堆栈 + 启动轨迹页，`MainActivity` 一行都不执行；`VvApp` 在进程最早阶段把崩溃记录写进 `last-crash.txt`；WebView 初始化异常与渲染进程被杀都会就地恢复，不再整体闪退 |
 | 启动自检 | 启动页显示版本号（含 versionCode）、Android 版本、WebView 包版本，可直接判断是否装上了新包；`BootLog` 把 `gate.open → main.onCreate → splash → webview.creating → webview.ready → loadUrl → page.started` 逐步写入 `files/boot.log`，页面开始渲染才标记 `healthy`；8 秒稳定运行后才清除崩溃计数，避免「一崩就清零」进不了安全模式 |
 | 安装包命名 | Release 同时上传 `VVPhone.apk` 与 `VVPhone-<run>.apk`；固定名容易被浏览器/CDN 缓存成旧包，排查「装了没变化」时一律用带版本号的文件 |
 | 沉浸式避坑 | `Window.getInsetsController()` 在 `DecorView` 创建前**不是返回 null，而是内部 NPE**（`PhoneWindow#getInsetsController` 直接调 `mDecor.getWindowInsetsController()`）。因此在 `onCreate` 里必须先 `getDecorView()` 强制安装 decor，并整段 `try/catch`；三星 Android 13 曾因这一行必崩 |
-| 软键盘避坑 | 底部 padding **不能加在 WebView 自己身上**：Chromium 的 viewport 取的是 View 的整体尺寸（含 padding），`100vh` 不变、消息输入框照样被盖住。必须让 WebView 的外层容器加 padding，WebView 的测量高度才会真的变小。另在 `index.html` 留了一层 `visualViewport` 兜底：个别 ROM 只报 visual 高度而没压缩 WebView 时，用 `html.vv-keyboard-open body { height: calc(100vh - var(--vv-keyboard)) }` 手动压矮 |
+| 软键盘避坑 | ① 底部 padding **不能加在 WebView 自己身上**：Chromium 的 viewport 取的是 View 的整体尺寸（含 padding），`100vh` 不变、消息输入框照样被盖住，必须加在 WebView 外层容器上。② 逐帧 padding **不能线性跟随 insets 动画**：键盘窗口自身的弹出动画在部分 ROM（三星很典型）上比 insets 动画慢，内容会冲在键盘前面，中间露出一条底色，用户描述就是「输入框动得太快、键盘跟不上、露出黑边」。弹出缓动要**滞后**（ease-in），收起缓动要**超前**（ease-out）。③ 前端**不要**再叠一层 `visualViewport` 压缩：`body` 是 `display:flex; align-items:center`，压矮 body 会让 `.phone-case` 上下同时收缩，用户看到的是「黑边 + 输入框上下跳」。④ 容器底色用浅色（白），万一有 1~2 帧露出来也不刺眼，黑色会非常显眼 |
 | 顶栏黑边避坑 | 顶部**绝对不要**按 `displayCutout` / `statusBars` 给容器加 `paddingTop`。padding 加在 WebView 自己身上时 Chromium 不缩 viewport，看不出问题；一旦挪到外层容器，WebView 就真的往下缩，屏幕顶端露出容器黑底，用户会直接说「不全屏了、顶栏成黑条」。要全屏就一路铺满，靠页面内容避开挖孔 |
 
 ## 本地构建（可选，需要 JDK 17 + Android SDK）

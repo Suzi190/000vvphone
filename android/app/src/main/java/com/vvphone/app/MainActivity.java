@@ -19,6 +19,7 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.MediaStore;
 import android.util.Base64;
 import android.util.Log;
@@ -86,7 +87,19 @@ public class MainActivity extends Activity {
     /** 上一次「稳定」状态下应用到底部的键盘/刘海高度，用来判断键盘是不是刚弹出。 */
     private int appliedBottomInset;
 
+    /** 键盘动画是否正在进行：为 true 时底部 padding 由 onProgress 逐帧驱动，insets 回调不要插手。 */
+    private boolean imeAnimating;
+
+    /** 键盘动画开始那一刻容器的底部 padding，逐帧插值以它为起点。 */
+    private int imeAnimationStartBottom;
+
+    /** 键盘动画开始的时刻：万一 ROM 没回调 onEnd，超时后自动恢复成直接套用 insets。 */
+    private long imeAnimationStartAtMs;
+
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    /** 键盘稳定后把焦点输入框滚进视野（做了去抖，避免动画期间反复滚动导致页面上下跳）。 */
+    private final Runnable scrollIntoViewTask = this::scrollFocusedFieldIntoView;
     private final ConcurrentHashMap<String, OutputStream> downloadStreams = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Uri> downloadUris = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, String> downloadPaths = new ConcurrentHashMap<>();
@@ -243,8 +256,10 @@ public class MainActivity extends Activity {
             // WebView 必须放在容器里：键盘弹出时给「容器」加底部 padding，WebView 的高度才会真的变小。
             // 直接把 padding 加在 WebView 自己身上没用——Chromium 的 viewport 取的是 View 的整体尺寸，
             // 页面里的 100vh 不会跟着键盘变化，底部输入框照样被盖住。
+            // 容器底色用浅色而不是黑色：键盘弹出过程中，容器底部 padding 区域会有几帧露在键盘上方，
+            // 黑色会非常刺眼（用户原话「露出黑边，丑死了」），浅色和 App 里的白色输入栏接近，几乎看不出来。
             FrameLayout host = new FrameLayout(this);
-            host.setBackgroundColor(Color.BLACK);
+            host.setBackgroundColor(Color.WHITE);
             host.addView(view, new FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
             contentHost = host;
@@ -464,13 +479,56 @@ public class MainActivity extends Activity {
     private void applyWindowInsets(View root) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             try {
-                // 让 padding 跟随键盘弹出/收起的动画逐帧变化，避免内容在动画结束时"跳"一下
                 root.setWindowInsetsAnimationCallback(new WindowInsetsAnimation.Callback(
-                        WindowInsetsAnimation.Callback.DISPATCH_MODE_CONTINUE_ON_SUBTREE) {
+                        WindowInsetsAnimation.Callback.DISPATCH_MODE_STOP) {
+                    @Override
+                    public WindowInsetsAnimation.Bounds onStart(WindowInsetsAnimation animation,
+                                                                WindowInsetsAnimation.Bounds bounds) {
+                        if ((animation.getTypeMask() & WindowInsets.Type.ime()) != 0) {
+                            imeAnimating = true;
+                            imeAnimationStartAtMs = SystemClock.uptimeMillis();
+                            imeAnimationStartBottom = root.getPaddingBottom();
+                        }
+                        return bounds;
+                    }
+
                     @Override
                     public WindowInsets onProgress(WindowInsets insets, List<WindowInsetsAnimation> running) {
-                        applyViewportInsets(root, insets, false);
+                        for (int i = 0; i < running.size(); i++) {
+                            WindowInsetsAnimation animation = running.get(i);
+                            if ((animation.getTypeMask() & WindowInsets.Type.ime()) == 0) {
+                                continue;
+                            }
+                            int frame = insets.getInsets(WindowInsets.Type.ime()).bottom;
+                            // 内容必须比键盘「晚到位」，否则中间会露出一条容器底色（原来是黑边）。
+                            // 弹出用 ease-in（内容上移慢于键盘上升），键盘顶边会一路盖住还没被内容填满的底部；
+                            // 收起用 ease-out（内容先落下去），同样不会在键盘上方留出空隙。
+                            // 之前是线性跟随 insets 动画，在键盘窗口自身动画比 insets 慢的 ROM（三星很典型）上，
+                            // 内容会一马当先冲上去，键盘追不上，中间就是一条黑边。
+                            float t = animation.getInterpolatedFraction();
+                            boolean opening = frame >= imeAnimationStartBottom;
+                            float eased = opening
+                                    ? t * t
+                                    : 1f - (1f - t) * (1f - t);
+                            setBottomInset(root, Math.round(imeAnimationStartBottom
+                                    + (frame - imeAnimationStartBottom) * eased));
+                            return insets;
+                        }
                         return insets;
+                    }
+
+                    @Override
+                    public void onEnd(WindowInsetsAnimation animation) {
+                        if ((animation.getTypeMask() & WindowInsets.Type.ime()) == 0) {
+                            return;
+                        }
+                        imeAnimating = false;
+                        imeAnimationStartAtMs = 0L;
+                        WindowInsets rootInsets = root.getRootWindowInsets();
+                        if (rootInsets != null) {
+                            // 动画收尾一律回到系统给的最终值，避免插值残留导致输入框差几个像素
+                            applyViewportInsets(root, rootInsets, true);
+                        }
                     }
                 });
             } catch (Throwable ignored) {
@@ -497,20 +555,38 @@ public class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             bottom = insets.getInsets(WindowInsets.Type.ime()).bottom;
         }
-        // 顶部一律不内缩：系统栏已隐藏，页面本来就该铺满整块屏幕。
-        // 这里千万不能按 displayCutout / statusBars 加 paddingTop——padding 加在容器上之后
-        // WebView 会真的往下缩，屏幕顶端立刻露出一条黑边，看起来就是"不全屏了"。
-        // 页面自己画的 44px 假状态栏里，时间和电量分列左右，中间的小挖孔不会挡住它们。
-        if (root.getPaddingTop() != 0 || root.getPaddingBottom() != bottom) {
-            root.setPadding(0, 0, 0, bottom);
+        // 键盘动画进行中：底部 padding 由 onProgress 的缓动曲线逐帧驱动。
+        // 这里如果也直接套用系统插值，两套值会互相覆盖，表现出来就是输入框「一窜一窜」地上下跳。
+        if (imeAnimating && imeAnimationStartAtMs > 0L
+                && SystemClock.uptimeMillis() - imeAnimationStartAtMs > 700L) {
+            // 保险：个别 ROM 不回调 onEnd，超时后不再等逐帧回调，直接按系统值落位
+            imeAnimating = false;
+            imeAnimationStartAtMs = 0L;
+        }
+        if (!imeAnimating) {
+            setBottomInset(root, bottom);
         }
 
-        if (settled) {
-            if (bottom > appliedBottomInset) {
-                // 键盘刚弹出：等这一帧布局完成后再滚动，否则测量还没更新
-                root.post(this::scrollFocusedFieldIntoView);
-            }
+        if (settled && !imeAnimating) {
+            boolean keyboardJustShown = bottom > appliedBottomInset;
             appliedBottomInset = bottom;
+            if (keyboardJustShown) {
+                // 去抖：动画/布局收尾期间 insets 可能连报几次，每次都滚一下页面就会上下跳
+                mainHandler.removeCallbacks(scrollIntoViewTask);
+                mainHandler.postDelayed(scrollIntoViewTask, 120);
+            }
+        }
+    }
+
+    /**
+     * 只改容器底部 padding：顶部一律不内缩。
+     * 这里千万不能按 displayCutout / statusBars 加 paddingTop——padding 加在容器上之后
+     * WebView 会真的往下缩，屏幕顶端立刻露出一条黑边，看起来就是"不全屏了"。
+     * 页面自己画的 44px 假状态栏里，时间和电量分列左右，中间的小挖孔不会挡住它们。
+     */
+    private void setBottomInset(View root, int bottom) {
+        if (root.getPaddingTop() != 0 || root.getPaddingBottom() != bottom) {
+            root.setPadding(0, 0, 0, bottom);
         }
     }
 
