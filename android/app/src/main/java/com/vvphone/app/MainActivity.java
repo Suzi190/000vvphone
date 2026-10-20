@@ -1002,25 +1002,26 @@ public class MainActivity extends Activity {
                 pushKeyboardHeight(0);
                 try {
                     Window window = getWindow();
+                    // adjustResize 的缩窗发生在 WindowManager 层，完全不依赖 insets 有没有上报，
+                    // 所以哪怕这台机器 ime inset 一直是 0，窗口也会被键盘顶小，输入框就露出来了。
                     window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        // 关键：恢复 decor 自己吃 insets，adjustResize 才会真的生效。
+                        // 但**不要**恢复系统栏——保持全屏观感，系统栏隐藏时 padding 为 0，不影响缩窗。
                         window.setDecorFitsSystemWindows(true);
                         WindowInsetsController controller = window.getInsetsController();
                         if (controller != null) {
-                            controller.show(WindowInsets.Type.statusBars()
+                            controller.hide(WindowInsets.Type.statusBars()
                                     | WindowInsets.Type.navigationBars());
                             controller.setSystemBarsBehavior(
-                                    WindowInsetsController.BEHAVIOR_DEFAULT);
+                                    WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
                         }
                     } else {
                         window.getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
                     }
                     if (contentHost != null) {
-                        // fitsSystemWindows 的 View 会自己把 insets 变成 padding，
-                        // 于是 WebView 真的变矮，页面 100vh 跟着键盘走。
-                        // 必须先摘掉我们自己的 listener，否则它会盖住 View 的默认实现。
+                        // 摘掉我们自己的 listener，让系统和 WebView 按原生方式处理，避免重复加 padding
                         contentHost.setOnApplyWindowInsetsListener(null);
-                        contentHost.setFitsSystemWindows(true);
                         contentHost.requestApplyInsets();
                     }
                     Log.i(TAG, "键盘高度测量失败，已降级为系统 resize 避让");
