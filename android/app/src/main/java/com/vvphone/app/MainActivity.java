@@ -12,6 +12,7 @@ import android.content.Intent;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.graphics.Insets;
 import android.graphics.drawable.ColorDrawable;
 import android.net.Uri;
 import android.os.Build;
@@ -30,6 +31,7 @@ import android.view.ViewConfiguration;
 import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowInsets;
+import android.view.WindowInsetsAnimation;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.webkit.ConsoleMessage;
@@ -44,6 +46,7 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -57,6 +60,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -78,7 +82,11 @@ public class MainActivity extends Activity {
     private static final int REQ_STORAGE_PERMISSION = 1002;
 
     private WebView webView;
+    private FrameLayout contentHost;
     private ValueCallback<Uri[]> filePathCallback;
+
+    /** 上一次「稳定」状态下应用到底部的键盘/刘海高度，用来判断键盘是不是刚弹出。 */
+    private int appliedBottomInset;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ConcurrentHashMap<String, OutputStream> downloadStreams = new ConcurrentHashMap<>();
@@ -232,14 +240,25 @@ public class MainActivity extends Activity {
             view.setBackgroundColor(Color.BLACK);
             view.setOverScrollMode(View.OVER_SCROLL_NEVER);
             configureWebView(view);
-            setContentView(view);
             webView = view;
+
+            // WebView 必须放在容器里：键盘弹出时给「容器」加底部 padding，WebView 的高度才会真的变小。
+            // 直接把 padding 加在 WebView 自己身上没用——Chromium 的 viewport 取的是 View 的整体尺寸，
+            // 页面里的 100vh 不会跟着键盘变化，底部输入框照样被盖住。
+            FrameLayout host = new FrameLayout(this);
+            host.setBackgroundColor(Color.BLACK);
+            host.addView(view, new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+            contentHost = host;
+            setContentView(host);
+            applyWindowInsets(host);
             BootLog.mark(this, "webview.ready");
             view.loadUrl(START_URL);
             BootLog.mark(this, "loadUrl");
             return true;
         } catch (Throwable error) {
             webView = null;
+            contentHost = null;
             Log.e(TAG, "WebView 初始化失败", error);
             CrashStore.record(this, error);
             showFatalScreen("VVPhone 启动失败",
@@ -393,6 +412,10 @@ public class MainActivity extends Activity {
         if (webView != null) {
             webView.onResume();
         }
+        if (contentHost != null) {
+            // 从后台回来时键盘状态可能已经变了，重新要一次 insets
+            contentHost.requestApplyInsets();
+        }
     }
     @Override
     protected void onPause() {
@@ -430,33 +453,88 @@ public class MainActivity extends Activity {
         view.setWebViewClient(new LocalAssetClient());
         view.setWebChromeClient(new AppChromeClient());
         view.setDownloadListener(new AppDownloadListener());
-        applyWindowInsets(view);
     }
 
     /**
-     * 全屏后自行处理刘海与软键盘占位：避免顶部内容被摄像头挖孔遮挡、底部输入框被键盘覆盖。
+     * 全屏沉浸式下系统不会替我们缩小窗口，软键盘只以 IME inset 的形式上报。
+     * 这里把 inset 转成「根容器的 padding」：WebView 的布局高度因此真的变矮，
+     * 页面里的 100vh / 底栏 flex 布局才会跟着上移，输入框不再被键盘盖住。
      */
-    private void applyWindowInsets(View view) {
-        view.setOnApplyWindowInsetsListener((v, insets) -> {
-            int top = 0;
-            int bottom = 0;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                android.graphics.Insets cutout = insets.getInsets(WindowInsets.Type.displayCutout());
-                android.graphics.Insets ime = insets.getInsets(WindowInsets.Type.ime());
-                top = cutout.top;
-                bottom = ime.bottom;
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                DisplayCutout cutout = insets.getDisplayCutout();
-                if (cutout != null) {
-                    top = cutout.getSafeInsetTop();
-                }
+    private void applyWindowInsets(View root) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                // 让 padding 跟随键盘弹出/收起的动画逐帧变化，避免内容在动画结束时"跳"一下
+                root.setWindowInsetsAnimationCallback(new WindowInsetsAnimation.Callback(
+                        WindowInsetsAnimation.Callback.DISPATCH_MODE_CONTINUE_ON_SUBTREE) {
+                    @Override
+                    public WindowInsets onProgress(WindowInsets insets, List<WindowInsetsAnimation> running) {
+                        applyViewportInsets(root, insets, false);
+                        return insets;
+                    }
+                });
+            } catch (Throwable ignored) {
+                // 个别 ROM 不支持动画回调，退化成 insets 变化时直接跳变
             }
-            if (v.getPaddingTop() != top || v.getPaddingBottom() != bottom) {
-                v.setPadding(0, top, 0, bottom);
+        }
+
+        root.setOnApplyWindowInsetsListener((v, insets) -> {
+            applyViewportInsets(v, insets, true);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                // 自己消费掉，避免 WebView 内部再对 IME inset 做一次滚动/缩放
+                return WindowInsets.CONSUMED;
             }
             return insets;
         });
-        view.requestApplyInsets();
+        root.requestApplyInsets();
+    }
+
+    /**
+     * @param settled true 表示这是键盘动画结束后的稳定状态，可以在键盘刚弹出时把焦点滚进可视区。
+     */
+    private void applyViewportInsets(View root, WindowInsets insets, boolean settled) {
+        int top = 0;
+        int bottom = 0;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Insets cutout = insets.getInsets(WindowInsets.Type.displayCutout());
+            Insets ime = insets.getInsets(WindowInsets.Type.ime());
+            top = cutout.top;
+            bottom = ime.bottom;
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            DisplayCutout cutout = insets.getDisplayCutout();
+            if (cutout != null) {
+                top = cutout.getSafeInsetTop();
+            }
+            // API 28 及以下由 adjustResize 真正压缩窗口，这里不再重复扣键盘高度
+        }
+
+        if (root.getPaddingTop() != top || root.getPaddingBottom() != bottom) {
+            root.setPadding(0, top, 0, bottom);
+        }
+
+        if (settled) {
+            if (bottom > appliedBottomInset) {
+                // 键盘刚弹出：等这一帧布局完成后再滚动，否则测量还没更新
+                root.post(this::scrollFocusedFieldIntoView);
+            }
+            appliedBottomInset = bottom;
+        }
+    }
+
+    /** 键盘把可视区压小后，把获得焦点的输入框滚进视野（只做最小滚动，不打断页面自身的滚动位置）。 */
+    private void scrollFocusedFieldIntoView() {
+        WebView view = webView;
+        if (view == null) {
+            return;
+        }
+        try {
+            view.evaluateJavascript(
+                    "(function(){var el=document.activeElement;"
+                            + "if(!el||el===document.body||typeof el.scrollIntoView!=='function')return;"
+                            + "el.scrollIntoView({block:'nearest',inline:'nearest'});})()",
+                    null);
+        } catch (Throwable ignored) {
+            // 页面尚未加载完成时忽略
+        }
     }
 
     /** 把 assets/www 通过 https 虚拟域名提供，替代 file:// 加载。 */
