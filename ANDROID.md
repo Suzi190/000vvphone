@@ -45,6 +45,11 @@ gradle assembleRelease
 # 产物：android/app/build/outputs/apk/release/app-release.apk
 ```
 
+## 静态校验已发布的 APK（没有设备时）
+
+- `assets/www/*` 里的 HTML/CSS/JS 和 `classes.dex` 里的字符串都是 UTF-8，直接按字节 grep 关键字即可（例如 `__vvKeyboardHeight`、`getDisplayMetrics`）。
+- **`AndroidManifest.xml` 不能这么查**：它是 aapt2 的 binary XML，`windowSoftInputMode` 的值会被编译成整数，文件里根本没有 `adjustResize` 这个字符串（`adjustResize` = `0x10`，`adjustNothing` = `0x30`）。要确认只能解析 chunk：跳过 8 字节 XML 头，遍历字符串池（type 0x0001）和 start element（type 0x0102），找到 name 为 `windowSoftInputMode` 的属性并读它的 typed value。
+
 ## 安装提示
 
 - 首次安装需在系统设置里允许「安装未知来源应用」。
