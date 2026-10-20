@@ -116,7 +116,10 @@
             }
 
             // 诊断条：把原生实际收到的 insets / 窗口尺寸显示出来。点一下可隐藏。
+            var diagHidden = false;
+
             function showDiag() {
+                if (diagHidden) return;
                 if (!window.VVAndroid || typeof VVAndroid.getDiag !== 'function') return;
                 var text;
                 try {
@@ -134,6 +137,7 @@
                         + 'font:10px/1.5 ui-monospace,Menlo,monospace;white-space:pre-wrap;'
                         + 'word-break:break-all;';
                     el.addEventListener('click', function () {
+                        diagHidden = true;
                         el.style.display = 'none';
                     });
                     (document.body || document.documentElement).appendChild(el);
