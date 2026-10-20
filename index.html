@@ -20,9 +20,8 @@
         (function () {
             var vv = window.visualViewport;
             if (!vv) return;
-            var raf = 0;
+            var pending = 0;
             function apply() {
-                raf = 0;
                 var root = document.documentElement;
                 var keyboard = Math.round(window.innerHeight - vv.height);
                 if (keyboard > 80) {
@@ -34,7 +33,10 @@
                 }
             }
             function schedule() {
-                if (!raf) raf = window.requestAnimationFrame(apply);
+                // 防抖：键盘动画过程中 visualViewport 尺寸每帧都变，若逐帧套用会和原生层的
+                // padding 动画互相打架（内容被压两次）。等尺寸稳定后再判断。
+                window.clearTimeout(pending);
+                pending = window.setTimeout(apply, 180);
             }
             vv.addEventListener('resize', schedule);
             vv.addEventListener('scroll', schedule);
