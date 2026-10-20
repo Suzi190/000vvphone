@@ -14,7 +14,7 @@
 
 | 要求 | 实现方式 |
 | --- | --- |
-| 全屏 | `Theme.Material.NoActionBar` + `windowFullscreen`，页面注入 `fullscreen-mode` 让 `.phone-case` 铺满屏幕 |
+| 全屏 | 直接使用系统 `@android:style/Theme.Material.NoActionBar`（不再自定义主题，避免旧系统解析新属性失败），窗口背景在代码里设为纯黑，页面注入 `fullscreen-mode` 让 `.phone-case` 铺满屏幕 |
 | 沉浸式 | Android 11+ 用 `WindowInsetsController` 隐藏状态栏/导航栏；低版本用 `SYSTEM_UI_FLAG_IMMERSIVE_STICKY`，上滑可临时呼出 |
 | 隐藏顶栏状态栏 | 系统状态栏与导航栏全部隐藏；刘海屏使用 `shortEdges` 并把安全区作为内容内边距，避免被挖孔遮挡 |
 | 数据导出 | 注入脚本接管 `<a download>` 的 `blob:` / `data:` 下载，分块通过 JS Bridge 写入「下载/VVPhone」；http(s) 直链交给系统 DownloadManager；对导出中的 blob URL 做引用计数保护，页面在 `click()` 后立即 `revokeObjectURL()` 也能完整落盘 |
@@ -23,7 +23,8 @@
 | 软键盘 | 监听 IME insets 给 WebView 增加底部内边距，聊天输入框不会被键盘遮住 |
 | 返回键 | 逐层返回：关闭弹层 → 退出聊天回到应用 → 从其他应用回桌面 → 已在桌面时退到后台 |
 | 滑动手势 | 从屏幕左边缘向右滑动即返回上一页：起手点须在边缘 28dp 内，拖动时页面跟手平移，超过 72dp 触发，未达阈值自动弹回；与返回键共用同一套逻辑 |
-| 崩溃防护 | 启动异常与运行中崩溃都会写出 `last-crash.txt` 并在下次启动显示可复制的错误页；WebView 渲染进程被杀时自动重建，不再整体闪退 |
+| 崩溃防护 | 启动入口是极简的 `CrashGateActivity` 闸门：连续崩溃时它直接显示可复制的堆栈页，`MainActivity` 一行都不执行；`VvApp` 在进程最早阶段把崩溃记录写进 `last-crash.txt`；WebView 初始化异常与渲染进程被杀都会就地恢复，不再整体闪退 |
+| 启动自检 | 启动页显示版本号（含 versionCode）、Android 版本、WebView 包版本，可直接判断是否装上了新包；8 秒稳定运行后才清除崩溃计数，避免「一崩就清零」进不了安全模式 |
 
 ## 本地构建（可选，需要 JDK 17 + Android SDK）
 

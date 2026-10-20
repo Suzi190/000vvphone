@@ -1,8 +1,0 @@
-<resources>
-
-    <!-- API 27+ 才支持 windowLightNavigationBar，单独放这里，低版本系统不会解析它 -->
-    <style name="AppTheme" parent="AppThemeBase">
-        <item name="android:windowLightNavigationBar">false</item>
-    </style>
-
-</resources>

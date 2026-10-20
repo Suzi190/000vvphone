@@ -9,8 +9,10 @@ import android.content.ClipboardManager;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.graphics.drawable.ColorDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -21,6 +23,7 @@ import android.provider.MediaStore;
 import android.util.Base64;
 import android.util.Log;
 import android.view.DisplayCutout;
+import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
@@ -48,18 +51,12 @@ import android.widget.Toast;
 
 import java.io.ByteArrayInputStream;
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.io.PrintWriter;
-import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
-import java.text.SimpleDateFormat;
-import java.util.Date;
 import java.util.HashMap;
-import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -94,28 +91,125 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        installCrashHandler();
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         setupWindow();
+        applyCutoutMode();
 
+        String recentCrash = CrashStore.readLastCrash(this);
+        int crashCount = CrashStore.crashCount(this);
+
+        // 连续崩溃时进入安全模式：本次不加载页面，保证用户至少能看到内容并反馈。
+        if (recentCrash != null && crashCount >= 2) {
+            showFatalScreen("VVPhone 连续 " + crashCount + " 次异常退出",
+                    "已进入安全模式：本次不加载页面，避免再次闪退。\n\n"
+                            + "点「复制信息」把下面的内容反馈；点「清空记录并重试」可再按正常流程启动一次。\n\n"
+                            + recentCrash,
+                    "清空记录并重试",
+                    () -> {
+                        CrashStore.clear(this);
+                        startWebViewPhase();
+                    });
+            return;
+        }
+
+        // 上一次运行异常退出：先给出可复制的堆栈页，而不是再次不明不白地闪退。
+        if (recentCrash != null) {
+            showFatalScreen("VVPhone 上次异常退出",
+                    "下面是上次崩溃时的信息（可复制后反馈）。\n\n" + recentCrash,
+                    "继续使用",
+                    () -> {
+                        CrashStore.clear(this);
+                        startWebViewPhase();
+                    });
+            return;
+        }
+
+        startWebViewPhase();
+    }
+
+    /**
+     * 先显示一个最朴素的启动页，再创建 WebView。
+     * 这样即使 WebView 阶段崩了，也能从「是否看到过启动页」判断崩溃发生在哪一层。
+     */
+    private void startWebViewPhase() {
+        showSplash();
+        mainHandler.postDelayed(() -> {
+            if (isFinishing() || isDestroyed()) {
+                return;
+            }
+            if (!createWebView()) {
+                return;
+            }
+            requestLegacyStoragePermission();
+            // 只有稳定运行一段时间才认为启动成功，否则一崩就清零会导致永远进不了安全模式。
+            mainHandler.postDelayed(this::markHealthy, 8000L);
+        }, 220L);
+    }
+
+    private void showSplash() {
+        try {
+            TextView splash = new TextView(this);
+            splash.setBackgroundColor(Color.BLACK);
+            splash.setTextColor(Color.parseColor("#9AA0AE"));
+            splash.setTextSize(13f);
+            splash.setGravity(Gravity.CENTER);
+            splash.setText("VVPhone " + appVersionLabel() + " 正在启动…\n\nAndroid " + Build.VERSION.RELEASE
+                    + " · API " + Build.VERSION.SDK_INT
+                    + "\nWebView " + webViewLabel());
+            setContentView(splash);
+        } catch (Throwable ignored) {
+            // 启动页失败不能影响主流程
+        }
+    }
+
+    /** 启动页 / 错误页上显示版本号，方便确认「是否真的装上了新包」。 */
+    @SuppressWarnings("deprecation")
+    private String appVersionLabel() {
+        try {
+            PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), 0);
+            return info.versionName + " (" + info.versionCode + ")";
+        } catch (Throwable ignored) {
+            return "unknown";
+        }
+    }
+
+    private String webViewLabel() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                PackageInfo info = WebView.getCurrentWebViewPackage();
+                if (info != null) {
+                    return info.packageName + " " + info.versionName;
+                }
+            }
+        } catch (Throwable ignored) {
+            // 部分 ROM 会抛异常
+        }
+        return "unknown";
+    }
+
+    private String diagnostics() {
+        return "app: " + appVersionLabel()
+                + "\nandroid: " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")"
+                + "\nmodel: " + Build.MANUFACTURER + " " + Build.MODEL
+                + "\nwebview: " + webViewLabel() + "\n";
+    }
+
+    private void markHealthy() {
+        if (webView == null || isFinishing() || isDestroyed()) {
+            return;
+        }
+        CrashStore.clear(this);
+    }
+
+    private void applyCutoutMode() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             WindowManager.LayoutParams params = getWindow().getAttributes();
-            params.layoutInDisplayCutoutMode =
-                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            params.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
             getWindow().setAttributes(params);
         }
+    }
 
-        // 上一次运行异常退出过：先给出可复制的堆栈页，而不是再次不明不白地闪退。
-        String recentCrash = readRecentCrash();
-        if (recentCrash != null) {
-            showFatalScreen("上次运行异常退出，下面是错误信息（可复制后反馈）：\n\n" + recentCrash, false);
-            return;
-        }
-
-        if (!createWebView()) {
-            return;
-        }
-
+    private void requestLegacyStoragePermission() {
         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P
                 && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
                 != PackageManager.PERMISSION_GRANTED) {
@@ -141,96 +235,20 @@ public class MainActivity extends Activity {
         } catch (Throwable error) {
             webView = null;
             Log.e(TAG, "WebView 初始化失败", error);
-            writeCrashFile(error);
-            showFatalScreen("WebView 初始化失败（多数是系统 WebView 被禁用或版本过低）：\n\n"
-                    + describe(error)
-                    + "\n\n处理办法：在应用商店更新「Android System WebView」或「Chrome」，然后点重新加载。", true);
+            CrashStore.record(this, error);
+            showFatalScreen("VVPhone 启动失败",
+                    "WebView 初始化失败（多数是系统 WebView 被禁用或版本过低）：\n\n"
+                            + CrashStore.describe(error)
+                            + "\n\n处理办法：在应用商店更新「Android System WebView」或「Chrome」，然后重试。",
+                    "重新加载",
+                    this::startWebViewPhase);
             return false;
         }
     }
 
-    private void installCrashHandler() {
-        final Thread.UncaughtExceptionHandler previous = Thread.getDefaultUncaughtExceptionHandler();
-        Thread.setDefaultUncaughtExceptionHandler((thread, error) -> {
-            writeCrashFile(error);
-            if (previous != null) {
-                previous.uncaughtException(thread, error);
-            } else {
-                android.os.Process.killProcess(android.os.Process.myPid());
-                System.exit(10);
-            }
-        });
-    }
+    // 崩溃记录的实现在 CrashStore 中，由 VvApp 在进程最早阶段安装。
 
-    private File crashFile() {
-        File dir = getExternalFilesDir(null);
-        if (dir == null) {
-            dir = getFilesDir();
-        }
-        return new File(dir, "last-crash.txt");
-    }
-
-    private void writeCrashFile(Throwable error) {
-        try (FileOutputStream out = new FileOutputStream(crashFile())) {
-            String header = "time: " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date())
-                    + "\nmodel: " + Build.MANUFACTURER + " " + Build.MODEL
-                    + "\nandroid: " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")"
-                    + "\n\n";
-            out.write((header + describe(error)).getBytes(StandardCharsets.UTF_8));
-        } catch (Throwable ignored) {
-            // 写日志本身失败时不能再次抛异常
-        }
-    }
-
-    /** 只关心最近 10 分钟内的崩溃记录，避免很久以前的记录一直挡住启动。 */
-    private String readRecentCrash() {
-        try {
-            File file = crashFile();
-            if (!file.isFile()) {
-                return null;
-            }
-            long age = System.currentTimeMillis() - file.lastModified();
-            if (age < 0 || age > 10 * 60 * 1000L) {
-                //noinspection ResultOfMethodCallIgnored
-                file.delete();
-                return null;
-            }
-            int size = (int) Math.min(file.length(), 64 * 1024L);
-            byte[] buffer = new byte[size];
-            int read;
-            try (FileInputStream in = new FileInputStream(file)) {
-                read = in.read(buffer);
-            }
-            if (read <= 0) {
-                return null;
-            }
-            return new String(buffer, 0, read, StandardCharsets.UTF_8);
-        } catch (Throwable ignored) {
-            return null;
-        }
-    }
-
-    private void clearCrashFile() {
-        try {
-            //noinspection ResultOfMethodCallIgnored
-            crashFile().delete();
-        } catch (Throwable ignored) {
-            // 忽略
-        }
-    }
-
-    private static String describe(Throwable error) {
-        if (error == null) {
-            return "unknown";
-        }
-        StringWriter writer = new StringWriter();
-        PrintWriter printer = new PrintWriter(writer);
-        error.printStackTrace(printer);
-        printer.flush();
-        return writer.toString();
-    }
-
-    private void showFatalScreen(String message, boolean withRetry) {
+    private void showFatalScreen(String titleText, String message, String actionLabel, Runnable action) {
         try {
             LinearLayout root = new LinearLayout(this);
             root.setOrientation(LinearLayout.VERTICAL);
@@ -238,15 +256,13 @@ public class MainActivity extends Activity {
             root.setPadding(dp(16), dp(28), dp(16), dp(16));
 
             TextView title = new TextView(this);
-            title.setText(withRetry ? "VVPhone 启动失败" : "VVPhone 上次异常退出");
+            title.setText(titleText);
             title.setTextColor(Color.WHITE);
             title.setTextSize(18f);
             root.addView(title);
 
             TextView hint = new TextView(this);
-            hint.setText(withRetry
-                    ? "点「重新加载」再试一次；若反复失败，请复制下面的信息反馈。"
-                    : "点「复制信息」后可粘贴反馈；点「继续使用」正常进入。");
+            hint.setText("点「复制信息」把内容发给开发者；也可以点右边按钮再试一次。");
             hint.setTextColor(Color.parseColor("#8A8A99"));
             hint.setTextSize(12f);
             hint.setPadding(0, dp(8), 0, dp(8));
@@ -254,7 +270,7 @@ public class MainActivity extends Activity {
 
             ScrollView scroll = new ScrollView(this);
             TextView body = new TextView(this);
-            body.setText(message);
+            body.setText(message + "\n\n" + diagnostics());
             body.setTextColor(Color.parseColor("#C8C8D2"));
             body.setTextSize(11f);
             body.setTextIsSelectable(true);
@@ -265,21 +281,9 @@ public class MainActivity extends Activity {
 
             LinearLayout buttons = new LinearLayout(this);
             buttons.setOrientation(LinearLayout.HORIZONTAL);
-            buttons.addView(makeButton("复制信息", () -> copyToClipboard(message)), weightParams());
-            if (withRetry) {
-                buttons.addView(makeButton("重新加载", () -> {
-                    if (createWebView()) {
-                        clearCrashFile();
-                    }
-                }), weightParams());
-            } else {
-                buttons.addView(makeButton("继续使用", () -> {
-                    clearCrashFile();
-                    if (createWebView()) {
-                        showToast("已恢复");
-                    }
-                }), weightParams());
-            }
+            buttons.addView(makeButton("复制信息",
+                    () -> copyToClipboard(diagnostics() + "\n" + titleText + "\n\n" + message)), weightParams());
+            buttons.addView(makeButton(actionLabel, action), weightParams());
             root.addView(buttons);
 
             setContentView(root);
@@ -322,6 +326,7 @@ public class MainActivity extends Activity {
     private void setupWindow() {
         Window window = getWindow();
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        window.setBackgroundDrawable(new ColorDrawable(Color.BLACK));
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             window.setDecorFitsSystemWindows(false);
         }

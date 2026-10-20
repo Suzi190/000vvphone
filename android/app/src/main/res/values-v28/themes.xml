@@ -1,9 +1,0 @@
-<resources>
-
-    <!-- API 28+ 才有刘海屏（DisplayCutout）相关主题属性 -->
-    <style name="AppTheme" parent="AppThemeBase">
-        <item name="android:windowLightNavigationBar">false</item>
-        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
-    </style>
-
-</resources>
