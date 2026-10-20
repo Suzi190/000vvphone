@@ -94,6 +94,7 @@ public class MainActivity extends Activity {
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         setupWindow();
         applyCutoutMode();
+        BootLog.mark(this, "main.onCreate");
 
         String recentCrash = CrashStore.readLastCrash(this);
         int crashCount = CrashStore.crashCount(this);
@@ -157,6 +158,7 @@ public class MainActivity extends Activity {
                     + " · API " + Build.VERSION.SDK_INT
                     + "\nWebView " + webViewLabel());
             setContentView(splash);
+            BootLog.mark(this, "splash");
         } catch (Throwable ignored) {
             // 启动页失败不能影响主流程
         }
@@ -222,6 +224,7 @@ public class MainActivity extends Activity {
      * 避免用户只看到「闪退」而拿不到任何线索。
      */
     private boolean createWebView() {
+        BootLog.mark(this, "webview.creating");
         try {
             WebView.setWebContentsDebuggingEnabled(true);
             WebView view = new SwipeBackWebView(this, this::handleBackAction);
@@ -230,7 +233,9 @@ public class MainActivity extends Activity {
             configureWebView(view);
             setContentView(view);
             webView = view;
+            BootLog.mark(this, "webview.ready");
             view.loadUrl(START_URL);
+            BootLog.mark(this, "loadUrl");
             return true;
         } catch (Throwable error) {
             webView = null;
@@ -491,8 +496,17 @@ public class MainActivity extends Activity {
         }
 
         @Override
+        public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+            super.onPageStarted(view, url, favicon);
+            // 页面已经开始渲染 = WebView 这一层是活的，后面的失败都不算「启动闪退」
+            BootLog.mark(MainActivity.this, "page.started");
+            BootLog.mark(MainActivity.this, "healthy");
+        }
+
+        @Override
         public void onPageFinished(WebView view, String url) {
             super.onPageFinished(view, url);
+            BootLog.mark(MainActivity.this, "page.finished");
             try {
                 view.evaluateJavascript(INJECT_JS, null);
             } catch (Throwable error) {
@@ -507,6 +521,7 @@ public class MainActivity extends Activity {
         @Override
         public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
             Log.e(TAG, "渲染进程已终止，重建 WebView");
+            BootLog.mark(MainActivity.this, "render.gone");
             if (view != webView) {
                 return true;
             }

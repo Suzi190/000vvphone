@@ -22,13 +22,11 @@ import android.widget.Toast;
  * 用户只看到「点了图标就闪退」，任何界面都来不及显示。
  * 所以真正没风险的入口放在这个尽量「什么都不做」的 Activity 上：
  * <ul>
- *   <li>没有连续崩溃：立刻转发到 {@link MainActivity}，几乎无感（透明转发 + 无过渡动画）。</li>
- *   <li>连续崩溃：停留在这个原生页面显示崩溃堆栈，可复制、可清空后重试。</li>
+ *   <li>没有异常记录：立刻转发到 {@link MainActivity}，几乎无感（透明转发 + 无过渡动画）。</li>
+ *   <li>上次崩溃过、或上次启动没走完：停留在这个原生页面显示崩溃堆栈与启动轨迹，可复制、可清空后重试。</li>
  * </ul>
  */
 public class CrashGateActivity extends Activity {
-
-    private static final int SAFE_MODE_THRESHOLD = 2;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -40,20 +38,29 @@ public class CrashGateActivity extends Activity {
         }
 
         int count;
-        String log;
+        String crashLog;
+        String bootTail;
+        boolean bootCompleted;
         try {
             count = CrashStore.crashCount(this);
-            log = CrashStore.readLastCrash(this);
+            crashLog = CrashStore.readLastCrash(this);
+            bootTail = BootLog.tail(this);
+            bootCompleted = BootLog.lastBootCompleted(this);
         } catch (Throwable error) {
             count = 0;
-            log = CrashStore.describe(error);
+            crashLog = CrashStore.describe(error);
+            bootTail = null;
+            bootCompleted = true;
         }
 
-        if (log != null && count >= SAFE_MODE_THRESHOLD) {
-            showDiagnostics(count, log);
+        // 上次崩溃过，或上次启动没走到「页面加载完成」（原生层崩溃抓不到 Java 堆栈）→ 先把现场摆出来
+        if (crashLog != null || !bootCompleted) {
+            showDiagnostics(count, crashLog, bootTail);
             return;
         }
 
+        BootLog.begin(this, "boot");
+        BootLog.mark(this, "gate.open");
         openMain();
     }
 
@@ -67,12 +74,19 @@ public class CrashGateActivity extends Activity {
         overridePendingTransition(0, 0);
     }
 
-    private void showDiagnostics(int count, String log) {
+    private void showDiagnostics(int count, String crashLog, String bootTail) {
         try {
-            String summary = "app: " + versionLabel()
-                    + "\nandroid: " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")"
-                    + "\nmodel: " + Build.MANUFACTURER + " " + Build.MODEL
-                    + "\n连续崩溃: " + count + " 次\n\n" + log;
+            StringBuilder builder = new StringBuilder();
+            builder.append("app: ").append(versionLabel())
+                    .append("\nandroid: ").append(Build.VERSION.RELEASE)
+                    .append(" (API ").append(Build.VERSION.SDK_INT).append(")")
+                    .append("\nmodel: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL)
+                    .append("\n崩溃次数: ").append(count)
+                    .append("\n\n--- 启动轨迹 (boot.log) ---\n")
+                    .append(bootTail == null ? "（无记录）" : bootTail.trim())
+                    .append("\n\n--- 崩溃堆栈 (last-crash.txt) ---\n")
+                    .append(crashLog == null ? "（没有 Java 堆栈：崩溃发生在原生层或进程被直接终止）" : crashLog);
+            String summary = builder.toString();
 
             LinearLayout root = new LinearLayout(this);
             root.setOrientation(LinearLayout.VERTICAL);
@@ -80,13 +94,13 @@ public class CrashGateActivity extends Activity {
             root.setPadding(dp(16), dp(28), dp(16), dp(16));
 
             TextView title = new TextView(this);
-            title.setText("VVPhone 连续 " + count + " 次异常退出");
+            title.setText("VVPhone 启动异常（已暂停加载）");
             title.setTextColor(Color.WHITE);
             title.setTextSize(18f);
             root.addView(title);
 
             TextView hint = new TextView(this);
-            hint.setText("为避免继续闪退，本次不加载页面。点「复制信息」把下面内容发给开发者。");
+            hint.setText("这次先不加载页面，把上次启动的最后一步和崩溃信息留在下面。\n点「复制信息」发给开发者，点「清空记录并重试」可再试一次。");
             hint.setTextColor(Color.parseColor("#8A8A99"));
             hint.setTextSize(12f);
             hint.setPadding(0, dp(8), 0, dp(8));
@@ -117,6 +131,9 @@ public class CrashGateActivity extends Activity {
             retry.setAllCaps(false);
             retry.setOnClickListener(v -> {
                 CrashStore.clear(this);
+                BootLog.clear(this);
+                BootLog.begin(this, "boot");
+                BootLog.mark(this, "gate.retry");
                 openMain();
             });
             buttons.addView(retry, weightParams());

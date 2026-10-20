@@ -68,13 +68,14 @@ jobs:
           set -e
           mkdir -p out
           cp android/app/build/outputs/apk/release/app-release.apk out/VVPhone.apk
+          cp android/app/build/outputs/apk/release/app-release.apk out/VVPhone-${{ github.run_number }}.apk
           ls -lh out
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: VVPhone-Android-APK
-          path: out/VVPhone.apk
+          name: VVPhone-Android-APK-${{ github.run_number }}
+          path: out/VVPhone-${{ github.run_number }}.apk
           if-no-files-found: error
           retention-days: 90
 
@@ -85,14 +86,21 @@ jobs:
           name: VVPhone Android APK
           overwrite_files: true
           body: |
-            VVPhone 安卓安装包（GitHub Actions 自动构建）
+            **本次构建：1.0.${{ github.run_number }}（versionCode ${{ github.run_number }}）**
 
+            请下载 `VVPhone-${{ github.run_number }}.apk` —— 文件名自带版本号，不会被浏览器/CDN 缓存成旧包。
+            `VVPhone.apk` 也指向最新构建，但缓存较顽固，遇到「怎么装都还是老问题」时请改用带版本号的文件。
+
+            - 启动闸门：连续崩溃时显示可复制的崩溃堆栈与启动轨迹，主界面不再无声闪退
+            - 启动页显示版本号 / Android 版本 / WebView 版本，可直接确认装的是新包
             - 全屏沉浸式：隐藏系统状态栏与导航栏
             - 数据导出：保存到手机「下载/VVPhone」目录
             - 数据导入：支持选择本地 JSON 备份文件
-            - 返回键：先回到桌面，再按一次退出
+            - 返回键与左边缘右滑：逐层返回（弹层 → 聊天 → 桌面 → 后台）
 
-            安装提示：首次安装需允许「安装未知来源应用」。
-          files: out/VVPhone.apk
+            安装提示：首次安装需允许「安装未知来源应用」；覆盖安装可保留数据。
+          files: |
+            out/VVPhone.apk
+            out/VVPhone-${{ github.run_number }}.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
