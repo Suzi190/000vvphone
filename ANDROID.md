@@ -22,6 +22,8 @@
 | 数据存储 | 使用 `https://appassets.androidplatform.net` 承载本地资源，IndexedDB 与 localStorage 在稳定 https 源下工作，和浏览器行为一致 |
 | 软键盘 | 监听 IME insets 给 WebView 增加底部内边距，聊天输入框不会被键盘遮住 |
 | 返回键 | 先调用页面 `goHome()` 回到桌面，已在桌面时退到后台 |
+| 滑动手势 | 从屏幕左边缘向右滑动即返回上一页：起手点须在边缘 28dp 内，拖动时页面跟手平移，超过 72dp 触发，未达阈值自动弹回；与返回键共用同一套逻辑 |
+| 崩溃防护 | 启动异常与运行中崩溃都会写出 `last-crash.txt` 并在下次启动显示可复制的错误页；WebView 渲染进程被杀时自动重建，不再整体闪退 |
 
 ## 本地构建（可选，需要 JDK 17 + Android SDK）
 

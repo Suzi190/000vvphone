@@ -5,6 +5,7 @@ import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.DownloadManager;
 import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
@@ -20,7 +21,10 @@ import android.provider.MediaStore;
 import android.util.Base64;
 import android.util.Log;
 import android.view.DisplayCutout;
+import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
+import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
@@ -28,6 +32,7 @@ import android.view.WindowManager;
 import android.webkit.ConsoleMessage;
 import android.webkit.DownloadListener;
 import android.webkit.JavascriptInterface;
+import android.webkit.RenderProcessGoneDetail;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
@@ -35,16 +40,26 @@ import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.Button;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.ByteArrayInputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -79,6 +94,7 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        installCrashHandler();
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         setupWindow();
 
@@ -89,19 +105,218 @@ public class MainActivity extends Activity {
             getWindow().setAttributes(params);
         }
 
-        webView = new WebView(this);
-        webView.setBackgroundColor(Color.BLACK);
-        webView.setOverScrollMode(View.OVER_SCROLL_NEVER);
-        configureWebView(webView);
-        setContentView(webView);
+        // 上一次运行异常退出过：先给出可复制的堆栈页，而不是再次不明不白地闪退。
+        String recentCrash = readRecentCrash();
+        if (recentCrash != null) {
+            showFatalScreen("上次运行异常退出，下面是错误信息（可复制后反馈）：\n\n" + recentCrash, false);
+            return;
+        }
+
+        if (!createWebView()) {
+            return;
+        }
 
         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P
                 && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
                 != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQ_STORAGE_PERMISSION);
         }
+    }
 
-        webView.loadUrl(START_URL);
+    /**
+     * 创建（或重建）WebView 并加载页面。初始化异常会被捕获并展示为错误页，
+     * 避免用户只看到「闪退」而拿不到任何线索。
+     */
+    private boolean createWebView() {
+        try {
+            WebView.setWebContentsDebuggingEnabled(true);
+            WebView view = new SwipeBackWebView(this, this::handleBackAction);
+            view.setBackgroundColor(Color.BLACK);
+            view.setOverScrollMode(View.OVER_SCROLL_NEVER);
+            configureWebView(view);
+            setContentView(view);
+            webView = view;
+            view.loadUrl(START_URL);
+            return true;
+        } catch (Throwable error) {
+            webView = null;
+            Log.e(TAG, "WebView 初始化失败", error);
+            writeCrashFile(error);
+            showFatalScreen("WebView 初始化失败（多数是系统 WebView 被禁用或版本过低）：\n\n"
+                    + describe(error)
+                    + "\n\n处理办法：在应用商店更新「Android System WebView」或「Chrome」，然后点重新加载。", true);
+            return false;
+        }
+    }
+
+    private void installCrashHandler() {
+        final Thread.UncaughtExceptionHandler previous = Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler((thread, error) -> {
+            writeCrashFile(error);
+            if (previous != null) {
+                previous.uncaughtException(thread, error);
+            } else {
+                android.os.Process.killProcess(android.os.Process.myPid());
+                System.exit(10);
+            }
+        });
+    }
+
+    private File crashFile() {
+        File dir = getExternalFilesDir(null);
+        if (dir == null) {
+            dir = getFilesDir();
+        }
+        return new File(dir, "last-crash.txt");
+    }
+
+    private void writeCrashFile(Throwable error) {
+        try (FileOutputStream out = new FileOutputStream(crashFile())) {
+            String header = "time: " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date())
+                    + "\nmodel: " + Build.MANUFACTURER + " " + Build.MODEL
+                    + "\nandroid: " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")"
+                    + "\n\n";
+            out.write((header + describe(error)).getBytes(StandardCharsets.UTF_8));
+        } catch (Throwable ignored) {
+            // 写日志本身失败时不能再次抛异常
+        }
+    }
+
+    /** 只关心最近 10 分钟内的崩溃记录，避免很久以前的记录一直挡住启动。 */
+    private String readRecentCrash() {
+        try {
+            File file = crashFile();
+            if (!file.isFile()) {
+                return null;
+            }
+            long age = System.currentTimeMillis() - file.lastModified();
+            if (age < 0 || age > 10 * 60 * 1000L) {
+                //noinspection ResultOfMethodCallIgnored
+                file.delete();
+                return null;
+            }
+            int size = (int) Math.min(file.length(), 64 * 1024L);
+            byte[] buffer = new byte[size];
+            int read;
+            try (FileInputStream in = new FileInputStream(file)) {
+                read = in.read(buffer);
+            }
+            if (read <= 0) {
+                return null;
+            }
+            return new String(buffer, 0, read, StandardCharsets.UTF_8);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private void clearCrashFile() {
+        try {
+            //noinspection ResultOfMethodCallIgnored
+            crashFile().delete();
+        } catch (Throwable ignored) {
+            // 忽略
+        }
+    }
+
+    private static String describe(Throwable error) {
+        if (error == null) {
+            return "unknown";
+        }
+        StringWriter writer = new StringWriter();
+        PrintWriter printer = new PrintWriter(writer);
+        error.printStackTrace(printer);
+        printer.flush();
+        return writer.toString();
+    }
+
+    private void showFatalScreen(String message, boolean withRetry) {
+        try {
+            LinearLayout root = new LinearLayout(this);
+            root.setOrientation(LinearLayout.VERTICAL);
+            root.setBackgroundColor(Color.parseColor("#101014"));
+            root.setPadding(dp(16), dp(28), dp(16), dp(16));
+
+            TextView title = new TextView(this);
+            title.setText(withRetry ? "VVPhone 启动失败" : "VVPhone 上次异常退出");
+            title.setTextColor(Color.WHITE);
+            title.setTextSize(18f);
+            root.addView(title);
+
+            TextView hint = new TextView(this);
+            hint.setText(withRetry
+                    ? "点「重新加载」再试一次；若反复失败，请复制下面的信息反馈。"
+                    : "点「复制信息」后可粘贴反馈；点「继续使用」正常进入。");
+            hint.setTextColor(Color.parseColor("#8A8A99"));
+            hint.setTextSize(12f);
+            hint.setPadding(0, dp(8), 0, dp(8));
+            root.addView(hint);
+
+            ScrollView scroll = new ScrollView(this);
+            TextView body = new TextView(this);
+            body.setText(message);
+            body.setTextColor(Color.parseColor("#C8C8D2"));
+            body.setTextSize(11f);
+            body.setTextIsSelectable(true);
+            body.setPadding(0, dp(8), 0, dp(8));
+            scroll.addView(body);
+            root.addView(scroll, new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+
+            LinearLayout buttons = new LinearLayout(this);
+            buttons.setOrientation(LinearLayout.HORIZONTAL);
+            buttons.addView(makeButton("复制信息", () -> copyToClipboard(message)), weightParams());
+            if (withRetry) {
+                buttons.addView(makeButton("重新加载", () -> {
+                    if (createWebView()) {
+                        clearCrashFile();
+                    }
+                }), weightParams());
+            } else {
+                buttons.addView(makeButton("继续使用", () -> {
+                    clearCrashFile();
+                    if (createWebView()) {
+                        showToast("已恢复");
+                    }
+                }), weightParams());
+            }
+            root.addView(buttons);
+
+            setContentView(root);
+        } catch (Throwable ignored) {
+            // 错误页本身失败时保持黑底，绝不能二次崩溃
+        }
+    }
+
+    private Button makeButton(String label, Runnable action) {
+        Button button = new Button(this);
+        button.setText(label);
+        button.setAllCaps(false);
+        button.setOnClickListener(v -> action.run());
+        return button;
+    }
+
+    private LinearLayout.LayoutParams weightParams() {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        params.setMargins(dp(4), 0, dp(4), 0);
+        return params;
+    }
+
+    private int dp(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    private void copyToClipboard(String text) {
+        try {
+            ClipboardManager manager = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            if (manager != null) {
+                manager.setPrimaryClip(ClipData.newPlainText("VVPhone", text));
+                showToast("已复制错误信息");
+            }
+        } catch (Throwable ignored) {
+            showToast("复制失败，请手动截图");
+        }
     }
 
     private void setupWindow() {
@@ -273,7 +488,46 @@ public class MainActivity extends Activity {
         @Override
         public void onPageFinished(WebView view, String url) {
             super.onPageFinished(view, url);
-            view.evaluateJavascript(INJECT_JS, null);
+            try {
+                view.evaluateJavascript(INJECT_JS, null);
+            } catch (Throwable error) {
+                Log.w(TAG, "注入脚本失败", error);
+            }
+        }
+
+        /**
+         * WebView 渲染进程崩溃（页面过重、内存不足等）默认会连带把整个 App 杀掉，
+         * 也就是用户看到的「闪退」。接管后自动重建 WebView，数据仍保留在 IndexedDB 里。
+         */
+        @Override
+        public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+            Log.e(TAG, "渲染进程已终止，重建 WebView");
+            if (view != webView) {
+                return true;
+            }
+            webView = null;
+            try {
+                ViewGroup parent = (ViewGroup) view.getParent();
+                if (parent != null) {
+                    parent.removeView(view);
+                }
+            } catch (Throwable ignored) {
+                // 忽略
+            }
+            try {
+                view.destroy();
+            } catch (Throwable ignored) {
+                // 忽略
+            }
+            mainHandler.post(() -> {
+                if (isFinishing() || isDestroyed()) {
+                    return;
+                }
+                if (createWebView()) {
+                    showToast("页面已自动恢复");
+                }
+            });
+            return true;
         }
     }
     /** 文件选择器：导入备份/主题预设/图片都依赖这个回调。 */
@@ -699,23 +953,38 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
-        if (webView == null) {
-            super.onBackPressed();
+        handleBackAction();
+    }
+
+    /**
+     * 返回逻辑（返回键与「左边缘右滑」手势共用）：
+     * 先让页面自己处理（退回桌面 / 关闭弹层），页面不处理时再退 WebView 历史，最后退到后台。
+     */
+    private void handleBackAction() {
+        WebView view = webView;
+        if (view == null) {
+            moveTaskToBack(true);
             return;
         }
-        webView.evaluateJavascript(
-                "(function(){try{return typeof window.__vvHandleBack==='function'"
-                        + "?(window.__vvHandleBack()?'1':'0'):'0';}catch(e){return '0';}})();",
-                value -> {
-                    if (value != null && value.contains("1")) {
-                        return;
-                    }
-                    if (webView != null && webView.canGoBack()) {
-                        webView.goBack();
-                    } else {
-                        moveTaskToBack(true);
-                    }
-                });
+        try {
+            view.evaluateJavascript(
+                    "(function(){try{return typeof window.__vvHandleBack==='function'"
+                            + "?(window.__vvHandleBack()?'1':'0'):'0';}catch(e){return '0';}})();",
+                    value -> {
+                        if (value != null && value.contains("1")) {
+                            return;
+                        }
+                        WebView current = webView;
+                        if (current != null && current.canGoBack()) {
+                            current.goBack();
+                        } else {
+                            moveTaskToBack(true);
+                        }
+                    });
+        } catch (Throwable error) {
+            Log.w(TAG, "返回处理失败", error);
+            moveTaskToBack(true);
+        }
     }
 
     @Override
@@ -740,13 +1009,133 @@ public class MainActivity extends Activity {
         }
         super.onDestroy();
     }
+
+    /**
+     * 支持「从屏幕左边缘向右滑动返回」的 WebView。
+     *
+     * 只在起手点落在左边缘 28dp 内时才跟踪，避免和页面内部的横向滑动（轮播、列表横滑）冲突；
+     * 拖动过程中 WebView 跟随手指平移，松手超过 72dp 就触发返回，不到阈值则弹回原位。
+     */
+    private static final class SwipeBackWebView extends WebView {
+
+        private final float edgePx;
+        private final float triggerPx;
+        private final int slopPx;
+        private final Runnable onSwipeBack;
+
+        private float downX;
+        private float downY;
+        private boolean tracking;
+        private boolean dragging;
+        private boolean fired;
+
+        SwipeBackWebView(Context context, Runnable onSwipeBack) {
+            super(context);
+            float density = context.getResources().getDisplayMetrics().density;
+            this.edgePx = 28f * density;
+            this.triggerPx = 72f * density;
+            this.slopPx = ViewConfiguration.get(context).getScaledTouchSlop();
+            this.onSwipeBack = onSwipeBack;
+        }
+
+        @Override
+        public boolean onTouchEvent(MotionEvent event) {
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    downX = event.getX();
+                    downY = event.getY();
+                    tracking = downX <= edgePx;
+                    dragging = false;
+                    fired = false;
+                    break;
+                case MotionEvent.ACTION_MOVE:
+                    if (fired) {
+                        return true;
+                    }
+                    if (tracking) {
+                        float dx = event.getX() - downX;
+                        float dy = Math.abs(event.getY() - downY);
+                        if (dx <= 0 || (dy > dx && dy > slopPx)) {
+                            // 竖直滚动或反向滑动：交还给页面处理
+                            tracking = false;
+                            stopDrag();
+                        } else if (dx > slopPx && dx > dy) {
+                            if (!dragging) {
+                                dragging = true;
+                                cancelWebViewGesture(event);
+                                if (getParent() instanceof ViewGroup) {
+                                    ((ViewGroup) getParent()).requestDisallowInterceptTouchEvent(true);
+                                }
+                            }
+                            setTranslationX(dx * 0.55f);
+                            if (dx >= triggerPx) {
+                                fired = true;
+                                tracking = false;
+                                stopDrag();
+                                if (onSwipeBack != null) {
+                                    onSwipeBack.run();
+                                }
+                            }
+                            return true;
+                        }
+                    }
+                    break;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    if (!fired) {
+                        stopDrag();
+                    }
+                    tracking = false;
+                    dragging = false;
+                    fired = false;
+                    break;
+                default:
+                    break;
+            }
+            return super.onTouchEvent(event);
+        }
+
+        private void stopDrag() {
+            if (getTranslationX() != 0f) {
+                setTranslationX(0f);
+            }
+        }
+
+        /** 手势被接管时给 WebView 补一个 CANCEL，避免页面停留在「按下未抬起」的状态。 */
+        private void cancelWebViewGesture(MotionEvent source) {
+            try {
+                MotionEvent cancel = MotionEvent.obtain(source);
+                cancel.setAction(MotionEvent.ACTION_CANCEL);
+                super.onTouchEvent(cancel);
+                cancel.recycle();
+            } catch (Throwable ignored) {
+                // 忽略
+            }
+        }
+    }
+
     /**
      * 注入到页面的适配脚本：
      * 1. 强制无边框全屏（App 内始终全屏）；
      * 2. 返回键先回桌面；
      * 3. 接管 &lt;a download&gt; 的 blob:/data: 下载，交给原生写入「下载/VVPhone」。
      */
-    private static final String INJECT_JS = String.join("\n",
+    /**
+     * 拼接多行脚本。这里刻意不用 String.join —— 它是 Java 8 API，在 Android 上
+     * 需要 API 26 才存在，而 minSdk 是 24，运行到 Android 7.x 会 NoSuchMethodError 闪退。
+     */
+    private static String joinLines(String... lines) {
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < lines.length; i++) {
+            if (i > 0) {
+                builder.append('\n');
+            }
+            builder.append(lines[i]);
+        }
+        return builder.toString();
+    }
+
+    private static final String INJECT_JS = joinLines(
             "(function () {",
             "  if (window.__vvNativeReady) { return; }",
             "  window.__vvNativeReady = true;",
@@ -777,9 +1166,28 @@ public class MainActivity extends Activity {
             "    new MutationObserver(forceFullscreen).observe(document.body, { attributes: true, attributeFilter: ['class'] });",
             "  }",
             "",
-            "  /* ---------- 2. 返回键先回桌面 ---------- */",
+            "  /* ---------- 2. 返回（返回键 / 左边缘右滑）：弹层 → 聊天 → 桌面 → 后台 ---------- */",
+            "  var OVERLAY_IDS = ['ctx-overlay', 'msg-context-menu', 'chat-settings-modal',",
+            "    'transfer-modal', 'thoughts-modal', 'offline-settings-modal',",
+            "    'calendar-event-modal', 'image-modal', 'video-modal', 'voice-modal'];",
+            "  function anyOverlayOpen() {",
+            "    for (var i = 0; i < OVERLAY_IDS.length; i++) {",
+            "      var el = document.getElementById(OVERLAY_IDS[i]);",
+            "      if (el && el.classList.contains('active')) { return true; }",
+            "    }",
+            "    return false;",
+            "  }",
             "  window.__vvHandleBack = function () {",
             "    try {",
+            "      if (anyOverlayOpen() && typeof window.closeAllOverlays === 'function') {",
+            "        window.closeAllOverlays();",
+            "        return true;",
+            "      }",
+            "      var chat = document.getElementById('chat-interface');",
+            "      if (chat && chat.style.display === 'flex' && typeof window.closeChat === 'function') {",
+            "        window.closeChat();",
+            "        return true;",
+            "      }",
             "      var home = document.getElementById('home-screen');",
             "      if (home && home.classList.contains('active')) { return false; }",
             "      if (typeof window.goHome === 'function') { window.goHome(); return true; }",
