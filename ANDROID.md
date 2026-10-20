@@ -17,7 +17,7 @@
 | 全屏 | `Theme.Material.NoActionBar` + `windowFullscreen`，页面注入 `fullscreen-mode` 让 `.phone-case` 铺满屏幕 |
 | 沉浸式 | Android 11+ 用 `WindowInsetsController` 隐藏状态栏/导航栏；低版本用 `SYSTEM_UI_FLAG_IMMERSIVE_STICKY`，上滑可临时呼出 |
 | 隐藏顶栏状态栏 | 系统状态栏与导航栏全部隐藏；刘海屏使用 `shortEdges` 并把安全区作为内容内边距，避免被挖孔遮挡 |
-| 数据导出 | 注入脚本接管 `<a download>` 的 `blob:` / `data:` 下载，分块通过 JS Bridge 写入「下载/VVPhone」；http(s) 直链交给系统 DownloadManager |
+| 数据导出 | 注入脚本接管 `<a download>` 的 `blob:` / `data:` 下载，分块通过 JS Bridge 写入「下载/VVPhone」；http(s) 直链交给系统 DownloadManager；对导出中的 blob URL 做引用计数保护，页面在 `click()` 后立即 `revokeObjectURL()` 也能完整落盘 |
 | 数据导入 | `WebChromeClient.onShowFileChooser` 打开系统文件选择器，支持 JSON 备份 / 主题预设 / 图片等所有 `<input type="file">` |
 | 数据存储 | 使用 `https://appassets.androidplatform.net` 承载本地资源，IndexedDB 与 localStorage 在稳定 https 源下工作，和浏览器行为一致 |
 | 软键盘 | 监听 IME insets 给 WebView 增加底部内边距，聊天输入框不会被键盘遮住 |
