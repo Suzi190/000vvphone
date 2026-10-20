@@ -20,7 +20,7 @@
 | 数据导出 | 注入脚本接管 `<a download>` 的 `blob:` / `data:` 下载，分块通过 JS Bridge 写入「下载/VVPhone」；http(s) 直链交给系统 DownloadManager；对导出中的 blob URL 做引用计数保护，页面在 `click()` 后立即 `revokeObjectURL()` 也能完整落盘 |
 | 数据导入 | `WebChromeClient.onShowFileChooser` 打开系统文件选择器，支持 JSON 备份 / 主题预设 / 图片等所有 `<input type="file">` |
 | 数据存储 | 使用 `https://appassets.androidplatform.net` 承载本地资源，IndexedDB 与 localStorage 在稳定 https 源下工作，和浏览器行为一致 |
-| 软键盘 | 监听 IME insets，把键盘高度加到**包住 WebView 的容器**的底部 padding 上：WebView 布局高度真的变矮，页面 `100vh` 跟着缩小，聊天输入框不会被键盘遮住；API 30+ 用 `WindowInsetsAnimation.Callback`（`DISPATCH_MODE_STOP`，不把动画再下发给 WebView）逐帧驱动 padding，并做了**方向性缓动**：弹出用 ease-in（内容上移慢于键盘上升）、收起用 ease-out（内容先落回去），保证容器底部始终被键盘或页面内容盖住；键盘稳定后（去抖 120ms）才把焦点输入框 `scrollIntoView({block:'nearest'})` 滚进可视区 |
+| 软键盘 | `windowSoftInputMode="adjustNothing"`：系统**不**替我们压窗口，键盘完全不参与窗口尺寸计算，只以 IME insets 上报，避让 100% 由我们控制（`adjustResize` 在部分 ROM 上会先 resize 一次窗口，再叠上我们的 padding，输入框就会被压两次、来回弹）。监听 IME insets，把键盘高度加到**包住 WebView 的容器**的底部 padding 上：WebView 布局高度真的变矮，页面 `100vh` 跟着缩小，聊天输入框不会被键盘遮住；API 30+ 用 `WindowInsetsAnimation.Callback`（`DISPATCH_MODE_STOP`，不把动画再下发给 WebView）逐帧驱动 padding，并做了**方向性缓动**：弹出用 ease-in（内容上移慢于键盘上升）、收起用 ease-out（内容先落回去），保证容器底部始终被键盘或页面内容盖住；键盘稳定后（去抖 120ms）才把焦点输入框 `scrollIntoView({block:'nearest'})` 滚进可视区 |
 | 返回键 | 逐层返回：关闭弹层 → 退出聊天回到应用 → 从其他应用回桌面 → 已在桌面时退到后台 |
 | 滑动手势 | 从屏幕左边缘向右滑动即返回上一页：起手点须在边缘 28dp 内，拖动时页面跟手平移，超过 72dp 触发，未达阈值自动弹回；与返回键共用同一套逻辑 |
 | 崩溃防护 | 启动入口是极简的 `CrashGateActivity` 闸门：上次崩溃过、或上次启动没走完（原生层崩溃抓不到 Java 堆栈）时，它直接显示可复制的堆栈 + 启动轨迹页，`MainActivity` 一行都不执行；`VvApp` 在进程最早阶段把崩溃记录写进 `last-crash.txt`；WebView 初始化异常与渲染进程被杀都会就地恢复，不再整体闪退 |
