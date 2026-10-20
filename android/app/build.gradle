@@ -1,0 +1,41 @@
+plugins {
+    id 'com.android.application'
+}
+
+def vvVersionCode = (project.findProperty('vvVersionCode') ?: '1').toString().toInteger()
+def vvVersionName = (project.findProperty('vvVersionName') ?: '1.0.0').toString()
+
+android {
+    namespace 'com.vvphone.app'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.vvphone.app'
+        minSdk 24
+        targetSdk 34
+        versionCode vvVersionCode
+        versionName vvVersionName
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+        }
+        release {
+            // 使用 debug 签名，保证产物可以直接安装；CI 会缓存 debug.keystore 以保持签名稳定。
+            signingConfig signingConfigs.debug
+            minifyEnabled false
+            shrinkResources false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}

@@ -1,0 +1,854 @@
+package com.vvphone.app;
+
+import android.Manifest;
+import android.annotation.SuppressLint;
+import android.app.Activity;
+import android.app.DownloadManager;
+import android.content.ClipData;
+import android.content.ContentValues;
+import android.content.Context;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.graphics.Color;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
+import android.provider.MediaStore;
+import android.util.Base64;
+import android.util.Log;
+import android.view.DisplayCutout;
+import android.view.View;
+import android.view.Window;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
+import android.view.WindowManager;
+import android.webkit.ConsoleMessage;
+import android.webkit.DownloadListener;
+import android.webkit.JavascriptInterface;
+import android.webkit.ValueCallback;
+import android.webkit.WebChromeClient;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
+import android.widget.Toast;
+
+import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/**
+ * VVPhone 的 Android 外壳。
+ *
+ * 1. 以 https://appassets.androidplatform.net 作为本地资源源站，保证 IndexedDB / localStorage
+ *    在稳定的 https 源下工作，导入导出（FileReader、Blob 下载）行为与浏览器一致。
+ * 2. 系统状态栏与导航栏全部隐藏（沉浸式），并适配刘海屏与软键盘。
+ * 3. 注入脚本接管 &lt;a download&gt; 的 blob:/data: 下载，通过 JS Bridge 分块写入「下载/VVPhone」。
+ */
+public class MainActivity extends Activity {
+
+    private static final String TAG = "VVPhone";
+    private static final String APP_HOST = "appassets.androidplatform.net";
+    private static final String START_URL = "https://" + APP_HOST + "/assets/index.html";
+    private static final int REQ_FILE_CHOOSER = 1001;
+    private static final int REQ_STORAGE_PERMISSION = 1002;
+
+    private WebView webView;
+    private ValueCallback<Uri[]> filePathCallback;
+
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final ConcurrentHashMap<String, OutputStream> downloadStreams = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Uri> downloadUris = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, String> downloadPaths = new ConcurrentHashMap<>();
+    private final AtomicInteger downloadSeq = new AtomicInteger(1);
+
+    @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+
+        requestWindowFeature(Window.FEATURE_NO_TITLE);
+        setupWindow();
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            WindowManager.LayoutParams params = getWindow().getAttributes();
+            params.layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            getWindow().setAttributes(params);
+        }
+
+        webView = new WebView(this);
+        webView.setBackgroundColor(Color.BLACK);
+        webView.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        configureWebView(webView);
+        setContentView(webView);
+
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P
+                && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQ_STORAGE_PERMISSION);
+        }
+
+        webView.loadUrl(START_URL);
+    }
+
+    private void setupWindow() {
+        Window window = getWindow();
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.setDecorFitsSystemWindows(false);
+        }
+        applyImmersiveMode();
+    }
+
+    /** 全屏沉浸式：隐藏系统状态栏与导航栏，上滑可临时呼出。 */
+    private void applyImmersiveMode() {
+        Window window = getWindow();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.setDecorFitsSystemWindows(false);
+            WindowInsetsController controller = window.getInsetsController();
+            if (controller != null) {
+                controller.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+                controller.setSystemBarsBehavior(
+                        WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            }
+        } else {
+            window.getDecorView().setSystemUiVisibility(
+                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                            | View.SYSTEM_UI_FLAG_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+        }
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) {
+            applyImmersiveMode();
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        applyImmersiveMode();
+        if (webView != null) {
+            webView.onResume();
+        }
+    }
+    @Override
+    protected void onPause() {
+        if (webView != null) {
+            webView.onPause();
+        }
+        super.onPause();
+    }
+
+    @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
+    private void configureWebView(WebView view) {
+        WebSettings settings = view.getSettings();
+        settings.setJavaScriptEnabled(true);
+        settings.setDomStorageEnabled(true);
+        settings.setDatabaseEnabled(true);
+        settings.setAllowFileAccess(true);
+        settings.setAllowContentAccess(true);
+        settings.setJavaScriptCanOpenWindowsAutomatically(true);
+        settings.setSupportMultipleWindows(false);
+        settings.setSupportZoom(false);
+        settings.setBuiltInZoomControls(false);
+        settings.setDisplayZoomControls(false);
+        settings.setUseWideViewPort(true);
+        settings.setLoadWithOverviewMode(true);
+        settings.setTextZoom(100);
+        settings.setMediaPlaybackRequiresUserGesture(false);
+        // 用户可能填写 http 协议的模型接口，本地源是 https，需要放开混合内容限制。
+        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+        settings.setCacheMode(WebSettings.LOAD_DEFAULT);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            settings.setSafeBrowsingEnabled(false);
+        }
+
+        view.addJavascriptInterface(new NativeBridge(), "VVAndroid");
+        view.setWebViewClient(new LocalAssetClient());
+        view.setWebChromeClient(new AppChromeClient());
+        view.setDownloadListener(new AppDownloadListener());
+        applyWindowInsets(view);
+    }
+
+    /**
+     * 全屏后自行处理刘海与软键盘占位：避免顶部内容被摄像头挖孔遮挡、底部输入框被键盘覆盖。
+     */
+    private void applyWindowInsets(View view) {
+        view.setOnApplyWindowInsetsListener((v, insets) -> {
+            int top = 0;
+            int bottom = 0;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                android.graphics.Insets cutout = insets.getInsets(WindowInsets.Type.displayCutout());
+                android.graphics.Insets ime = insets.getInsets(WindowInsets.Type.ime());
+                top = cutout.top;
+                bottom = ime.bottom;
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                DisplayCutout cutout = insets.getDisplayCutout();
+                if (cutout != null) {
+                    top = cutout.getSafeInsetTop();
+                }
+            }
+            if (v.getPaddingTop() != top || v.getPaddingBottom() != bottom) {
+                v.setPadding(0, top, 0, bottom);
+            }
+            return insets;
+        });
+        view.requestApplyInsets();
+    }
+
+    /** 把 assets/www 通过 https 虚拟域名提供，替代 file:// 加载。 */
+    private final class LocalAssetClient extends WebViewClient {
+
+        @Override
+        public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+            Uri uri = request.getUrl();
+            if (uri != null && APP_HOST.equals(uri.getHost())) {
+                String path = uri.getPath();
+                if (path == null || path.isEmpty()) {
+                    path = "/assets/index.html";
+                }
+                if (!path.startsWith("/assets/")) {
+                    path = "/assets" + path;
+                }
+                String assetPath = "www/" + path.substring("/assets/".length());
+                if (assetPath.endsWith("/")) {
+                    assetPath = assetPath + "index.html";
+                }
+                try {
+                    InputStream stream = getAssets().open(assetPath);
+                    String mime = guessMimeType(assetPath);
+                    String charset = isTextMime(mime) ? "utf-8" : null;
+                    WebResourceResponse response = new WebResourceResponse(mime, charset, stream);
+                    Map<String, String> headers = new HashMap<>();
+                    headers.put("Cache-Control", "no-cache");
+                    headers.put("Access-Control-Allow-Origin", "*");
+                    response.setResponseHeaders(headers);
+                    return response;
+                } catch (IOException e) {
+                    return new WebResourceResponse("text/plain", "utf-8",
+                            new ByteArrayInputStream(("资源未找到: " + assetPath).getBytes(StandardCharsets.UTF_8)));
+                }
+            }
+            return super.shouldInterceptRequest(view, request);
+        }
+
+        @Override
+        public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+            Uri uri = request.getUrl();
+            if (uri == null || APP_HOST.equals(uri.getHost())) {
+                return false;
+            }
+            String scheme = uri.getScheme() == null ? "" : uri.getScheme();
+            if ("http".equals(scheme) || "https".equals(scheme)) {
+                try {
+                    startActivity(new Intent(Intent.ACTION_VIEW, uri));
+                    return true;
+                } catch (Exception ignored) {
+                    return false;
+                }
+            }
+            return false;
+        }
+
+        @Override
+        public void onPageFinished(WebView view, String url) {
+            super.onPageFinished(view, url);
+            view.evaluateJavascript(INJECT_JS, null);
+        }
+    }
+    /** 文件选择器：导入备份/主题预设/图片都依赖这个回调。 */
+    private final class AppChromeClient extends WebChromeClient {
+
+        @Override
+        public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback,
+                                         FileChooserParams params) {
+            if (filePathCallback != null) {
+                filePathCallback.onReceiveValue(null);
+                filePathCallback = null;
+            }
+            filePathCallback = callback;
+
+            Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.setType("*/*");
+            if (params != null) {
+                intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE,
+                        params.getMode() == FileChooserParams.MODE_OPEN_MULTIPLE);
+            }
+            try {
+                startActivityForResult(Intent.createChooser(intent, "选择文件"), REQ_FILE_CHOOSER);
+                return true;
+            } catch (Exception e) {
+                filePathCallback = null;
+                showToast("无法打开文件选择器");
+                return false;
+            }
+        }
+
+        @Override
+        public boolean onConsoleMessage(ConsoleMessage message) {
+            if (message != null) {
+                Log.d(TAG, message.message() + " @" + message.sourceId() + ":" + message.lineNumber());
+            }
+            return true;
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (requestCode == REQ_FILE_CHOOSER) {
+            if (filePathCallback == null) {
+                super.onActivityResult(requestCode, resultCode, data);
+                return;
+            }
+            Uri[] results = null;
+            if (resultCode == RESULT_OK && data != null) {
+                ClipData clipData = data.getClipData();
+                if (clipData != null && clipData.getItemCount() > 0) {
+                    results = new Uri[clipData.getItemCount()];
+                    for (int i = 0; i < clipData.getItemCount(); i++) {
+                        results[i] = clipData.getItemAt(i).getUri();
+                    }
+                } else if (data.getData() != null) {
+                    results = new Uri[]{data.getData()};
+                }
+            }
+            filePathCallback.onReceiveValue(results);
+            filePathCallback = null;
+            return;
+        }
+        super.onActivityResult(requestCode, resultCode, data);
+    }
+
+    /** http(s) 直链交给系统 DownloadManager，blob:/data: 交给注入脚本。 */
+    private final class AppDownloadListener implements DownloadListener {
+        @Override
+        public void onDownloadStart(String url, String userAgent, String contentDisposition,
+                                    String mimetype, long contentLength) {
+            if (url == null) {
+                return;
+            }
+            if (url.startsWith("blob:") || url.startsWith("data:")) {
+                String js = "(function(){try{if(window.__vvSaveUrl){window.__vvSaveUrl("
+                        + jsString(url) + "," + jsString(guessFileNameFromUrl(url, mimetype))
+                        + ");}}catch(e){}})();";
+                webView.evaluateJavascript(js, null);
+                return;
+            }
+            try {
+                String fileName = guessFileNameFromUrl(url, mimetype);
+                DownloadManager.Request request = new DownloadManager.Request(Uri.parse(url));
+                request.setMimeType(mimetype);
+                if (userAgent != null) {
+                    request.addRequestHeader("User-Agent", userAgent);
+                }
+                request.setTitle(fileName);
+                request.setNotificationVisibility(
+                        DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                request.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS,
+                        "VVPhone/" + fileName);
+                DownloadManager manager = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+                if (manager != null) {
+                    manager.enqueue(request);
+                }
+                showToast("已开始下载：" + fileName);
+            } catch (Exception e) {
+                Log.w(TAG, "DownloadManager 下载失败", e);
+                try {
+                    startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+                } catch (Exception ignored) {
+                    showToast("下载失败，请检查网络");
+                }
+            }
+        }
+    }
+    /** 注入到页面的 window.VVAndroid：分块写入下载文件。 */
+    private final class NativeBridge {
+
+        @JavascriptInterface
+        public String startDownload(String fileName, String mimeType) {
+            try {
+                String safeName = sanitizeFileName(fileName);
+                String id = "vv_" + downloadSeq.getAndIncrement() + "_" + System.currentTimeMillis();
+                String mime = (mimeType == null || mimeType.trim().isEmpty())
+                        ? guessMimeType(safeName) : mimeType;
+
+                OutputStream stream;
+                Uri uri = null;
+                String displayPath;
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    ContentValues values = new ContentValues();
+                    values.put(MediaStore.MediaColumns.DISPLAY_NAME, safeName);
+                    values.put(MediaStore.MediaColumns.MIME_TYPE, mime);
+                    values.put(MediaStore.MediaColumns.RELATIVE_PATH,
+                            Environment.DIRECTORY_DOWNLOADS + "/VVPhone");
+                    values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+                    uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                    if (uri == null) {
+                        return "ERR:无法创建下载文件";
+                    }
+                    stream = getContentResolver().openOutputStream(uri);
+                    displayPath = "下载/VVPhone/" + safeName;
+                } else {
+                    File dir = resolveLegacyDownloadDir();
+                    if (dir == null) {
+                        return "ERR:没有可写入的存储目录";
+                    }
+                    File target = uniqueFile(dir, safeName);
+                    stream = new FileOutputStream(target);
+                    displayPath = target.getAbsolutePath();
+                }
+
+                if (stream == null) {
+                    if (uri != null) {
+                        getContentResolver().delete(uri, null, null);
+                    }
+                    return "ERR:无法写入文件";
+                }
+
+                downloadStreams.put(id, stream);
+                if (uri != null) {
+                    downloadUris.put(id, uri);
+                }
+                downloadPaths.put(id, displayPath);
+                return id;
+            } catch (Exception e) {
+                Log.w(TAG, "创建下载文件失败", e);
+                return "ERR:" + (e.getMessage() == null ? "创建文件失败" : e.getMessage());
+            }
+        }
+
+        @JavascriptInterface
+        public boolean writeChunk(String id, String base64Chunk) {
+            OutputStream stream = downloadStreams.get(id);
+            if (stream == null || base64Chunk == null) {
+                return false;
+            }
+            try {
+                byte[] bytes = Base64.decode(base64Chunk, Base64.DEFAULT);
+                synchronized (stream) {
+                    stream.write(bytes);
+                }
+                return true;
+            } catch (Exception e) {
+                Log.w(TAG, "写入下载分块失败", e);
+                return false;
+            }
+        }
+
+        @JavascriptInterface
+        public boolean finishDownload(String id) {
+            OutputStream stream = downloadStreams.remove(id);
+            Uri uri = downloadUris.remove(id);
+            String path = downloadPaths.remove(id);
+            boolean ok = stream != null;
+            if (stream != null) {
+                try {
+                    stream.flush();
+                    stream.close();
+                } catch (Exception ignored) {
+                    ok = false;
+                }
+            }
+            if (ok && uri != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                try {
+                    ContentValues values = new ContentValues();
+                    values.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                    getContentResolver().update(uri, values, null, null);
+                } catch (Exception ignored) {
+                    // 文件已写入，仅 pending 标记更新失败时不阻断流程
+                }
+            }
+            showToast(ok ? "已保存到 " + (path == null ? "下载/VVPhone" : path) : "保存失败");
+            return ok;
+        }
+
+        @JavascriptInterface
+        public void toast(String message) {
+            showToast(message);
+        }
+    }
+    private File resolveLegacyDownloadDir() {
+        boolean canWritePublic = Environment.MEDIA_MOUNTED.equals(Environment.getExternalStorageState())
+                && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                == PackageManager.PERMISSION_GRANTED;
+        if (canWritePublic) {
+            File dir = new File(Environment.getExternalStoragePublicDirectory(
+                    Environment.DIRECTORY_DOWNLOADS), "VVPhone");
+            if (dir.exists() || dir.mkdirs()) {
+                return dir;
+            }
+        }
+        File fallback = new File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "VVPhone");
+        if (fallback.exists() || fallback.mkdirs()) {
+            return fallback;
+        }
+        return null;
+    }
+
+    private static File uniqueFile(File dir, String name) {
+        File file = new File(dir, name);
+        if (!file.exists()) {
+            return file;
+        }
+        String base = name;
+        String ext = "";
+        int dot = name.lastIndexOf('.');
+        if (dot > 0) {
+            base = name.substring(0, dot);
+            ext = name.substring(dot);
+        }
+        int index = 1;
+        while (file.exists() && index < 1000) {
+            file = new File(dir, base + "(" + index + ")" + ext);
+            index++;
+        }
+        return file;
+    }
+
+    private static String sanitizeFileName(String name) {
+        String base = (name == null || name.trim().isEmpty()) ? "vvphone_download" : name.trim();
+        base = base.replace('\\', '_').replace('/', '_').replace(':', '_')
+                .replace('*', '_').replace('?', '_').replace('"', '_')
+                .replace('<', '_').replace('>', '_').replace('|', '_');
+        if (base.length() > 120) {
+            String ext = "";
+            int dot = base.lastIndexOf('.');
+            if (dot > 0 && base.length() - dot <= 10) {
+                ext = base.substring(dot);
+            }
+            base = base.substring(0, 100) + ext;
+        }
+        return base;
+    }
+    private static String guessFileNameFromUrl(String url, String mime) {
+        try {
+            String segment = Uri.parse(url).getLastPathSegment();
+            if (segment != null && !segment.isEmpty()) {
+                return sanitizeFileName(segment);
+            }
+        } catch (Exception ignored) {
+            // 落到下面的默认命名
+        }
+        return sanitizeFileName("vvphone_" + System.currentTimeMillis() + guessExtension(mime));
+    }
+
+    private static String guessExtension(String mime) {
+        if (mime == null) {
+            return ".bin";
+        }
+        String value = mime.toLowerCase();
+        if (value.contains("json")) {
+            return ".json";
+        }
+        if (value.contains("jpeg") || value.contains("jpg")) {
+            return ".jpg";
+        }
+        if (value.contains("png")) {
+            return ".png";
+        }
+        if (value.contains("plain")) {
+            return ".txt";
+        }
+        if (value.contains("zip")) {
+            return ".zip";
+        }
+        if (value.contains("mp4")) {
+            return ".mp4";
+        }
+        if (value.contains("mpeg")) {
+            return ".mp3";
+        }
+        return ".bin";
+    }
+
+    private static String guessMimeType(String path) {
+        String value = path == null ? "" : path.toLowerCase();
+        if (value.endsWith(".html") || value.endsWith(".htm")) {
+            return "text/html";
+        }
+        if (value.endsWith(".js") || value.endsWith(".mjs")) {
+            return "application/javascript";
+        }
+        if (value.endsWith(".css")) {
+            return "text/css";
+        }
+        if (value.endsWith(".json")) {
+            return "application/json";
+        }
+        if (value.endsWith(".png")) {
+            return "image/png";
+        }
+        if (value.endsWith(".jpg") || value.endsWith(".jpeg")) {
+            return "image/jpeg";
+        }
+        if (value.endsWith(".gif")) {
+            return "image/gif";
+        }
+        if (value.endsWith(".webp")) {
+            return "image/webp";
+        }
+        if (value.endsWith(".svg")) {
+            return "image/svg+xml";
+        }
+        if (value.endsWith(".ico")) {
+            return "image/x-icon";
+        }
+        if (value.endsWith(".woff2")) {
+            return "font/woff2";
+        }
+        if (value.endsWith(".woff")) {
+            return "font/woff";
+        }
+        if (value.endsWith(".ttf")) {
+            return "font/ttf";
+        }
+        if (value.endsWith(".otf")) {
+            return "font/otf";
+        }
+        if (value.endsWith(".mp3")) {
+            return "audio/mpeg";
+        }
+        if (value.endsWith(".wav")) {
+            return "audio/wav";
+        }
+        if (value.endsWith(".mp4")) {
+            return "video/mp4";
+        }
+        if (value.endsWith(".txt") || value.endsWith(".md")) {
+            return "text/plain";
+        }
+        return "application/octet-stream";
+    }
+
+    private static boolean isTextMime(String mime) {
+        if (mime == null) {
+            return false;
+        }
+        return mime.startsWith("text/")
+                || mime.contains("javascript")
+                || mime.contains("json")
+                || mime.contains("svg");
+    }
+
+    private static String jsString(String value) {
+        if (value == null) {
+            return "\"\"";
+        }
+        StringBuilder builder = new StringBuilder(value.length() + 16);
+        builder.append('"');
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            switch (c) {
+                case '\\':
+                    builder.append("\\\\");
+                    break;
+                case '"':
+                    builder.append("\\\"");
+                    break;
+                case '\n':
+                    builder.append("\\n");
+                    break;
+                case '\r':
+                    builder.append("\\r");
+                    break;
+                default:
+                    if (c < 0x20) {
+                        builder.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        builder.append(c);
+                    }
+            }
+        }
+        return builder.append('"').toString();
+    }
+
+    private void showToast(String message) {
+        if (message == null) {
+            return;
+        }
+        mainHandler.post(() -> {
+            try {
+                Toast.makeText(MainActivity.this, message, Toast.LENGTH_LONG).show();
+            } catch (Exception ignored) {
+                // Activity 已销毁时忽略
+            }
+        });
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (webView == null) {
+            super.onBackPressed();
+            return;
+        }
+        webView.evaluateJavascript(
+                "(function(){try{return typeof window.__vvHandleBack==='function'"
+                        + "?(window.__vvHandleBack()?'1':'0'):'0';}catch(e){return '0';}})();",
+                value -> {
+                    if (value != null && value.contains("1")) {
+                        return;
+                    }
+                    if (webView != null && webView.canGoBack()) {
+                        webView.goBack();
+                    } else {
+                        moveTaskToBack(true);
+                    }
+                });
+    }
+
+    @Override
+    protected void onDestroy() {
+        for (OutputStream stream : downloadStreams.values()) {
+            try {
+                stream.close();
+            } catch (Exception ignored) {
+                // 退出时忽略清理错误
+            }
+        }
+        downloadStreams.clear();
+        downloadUris.clear();
+        downloadPaths.clear();
+        if (webView != null) {
+            try {
+                webView.destroy();
+            } catch (Exception ignored) {
+                // 忽略
+            }
+            webView = null;
+        }
+        super.onDestroy();
+    }
+    /**
+     * 注入到页面的适配脚本：
+     * 1. 强制无边框全屏（App 内始终全屏）；
+     * 2. 返回键先回桌面；
+     * 3. 接管 &lt;a download&gt; 的 blob:/data: 下载，交给原生写入「下载/VVPhone」。
+     */
+    private static final String INJECT_JS = String.join("\n",
+            "(function () {",
+            "  if (window.__vvNativeReady) { return; }",
+            "  window.__vvNativeReady = true;",
+            "  var BRIDGE = window.VVAndroid || null;",
+            "",
+            "  /* ---------- 1. 无边框全屏 ---------- */",
+            "  var STYLE_ID = 'vv-native-fullscreen-style';",
+            "  function forceFullscreen() {",
+            "    try {",
+            "      var body = document.body;",
+            "      if (body && !body.classList.contains('fullscreen-mode')) {",
+            "        body.classList.add('fullscreen-mode');",
+            "      }",
+            "    } catch (e) { }",
+            "  }",
+            "  if (!document.getElementById(STYLE_ID)) {",
+            "    var style = document.createElement('style');",
+            "    style.id = STYLE_ID;",
+            "    style.textContent = [",
+            "      'html,body{height:100%!important;max-height:100%!important;overflow:hidden!important;}',",
+            "      'body.fullscreen-mode .phone-case{width:100%!important;height:100%!important;border:none!important;border-radius:0!important;box-shadow:none!important;}',",
+            "      'input,textarea,[contenteditable=true]{user-select:text!important;-webkit-user-select:text!important;}'",
+            "    ].join('');",
+            "    (document.head || document.documentElement).appendChild(style);",
+            "  }",
+            "  forceFullscreen();",
+            "  if (document.body && typeof MutationObserver === 'function') {",
+            "    new MutationObserver(forceFullscreen).observe(document.body, { attributes: true, attributeFilter: ['class'] });",
+            "  }",
+            "",
+            "  /* ---------- 2. 返回键先回桌面 ---------- */",
+            "  window.__vvHandleBack = function () {",
+            "    try {",
+            "      var home = document.getElementById('home-screen');",
+            "      if (home && home.classList.contains('active')) { return false; }",
+            "      if (typeof window.goHome === 'function') { window.goHome(); return true; }",
+            "    } catch (e) { }",
+            "    return false;",
+            "  };",
+            "",
+            "  /* ---------- 3. 导出下载 ---------- */",
+            "  function notify(message) {",
+            "    try { if (BRIDGE && BRIDGE.toast) { BRIDGE.toast(String(message)); } } catch (e) { }",
+            "  }",
+            "  function toBase64(bytes) {",
+            "    var binary = '';",
+            "    var SIZE = 0x8000;",
+            "    for (var i = 0; i < bytes.length; i += SIZE) {",
+            "      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + SIZE));",
+            "    }",
+            "    return btoa(binary);",
+            "  }",
+            "  function readArrayBuffer(blob) {",
+            "    return new Promise(function (resolve, reject) {",
+            "      var reader = new FileReader();",
+            "      reader.onload = function () { resolve(reader.result); };",
+            "      reader.onerror = function () { reject(reader.error || new Error('读取失败')); };",
+            "      reader.readAsArrayBuffer(blob);",
+            "    });",
+            "  }",
+            "  function saveUrl(url, name) {",
+            "    if (!BRIDGE) { notify('当前环境不支持保存文件'); return Promise.resolve(false); }",
+            "    return fetch(url).then(function (response) { return response.blob(); }).then(function (blob) {",
+            "      var id = BRIDGE.startDownload(name || ('vvphone_' + Date.now()), blob.type || 'application/octet-stream');",
+            "      if (!id || String(id).indexOf('ERR:') === 0) {",
+            "        throw new Error(String(id || '').replace('ERR:', '') || '无法创建文件');",
+            "      }",
+            "      var CHUNK = 384 * 1024;",
+            "      var offset = 0;",
+            "      function step() {",
+            "        if (offset >= blob.size) {",
+            "          BRIDGE.finishDownload(id);",
+            "          return Promise.resolve(true);",
+            "        }",
+            "        var part = blob.slice(offset, Math.min(offset + CHUNK, blob.size));",
+            "        offset += CHUNK;",
+            "        return readArrayBuffer(part).then(function (buffer) {",
+            "          if (!BRIDGE.writeChunk(id, toBase64(new Uint8Array(buffer)))) {",
+            "            throw new Error('写入文件失败');",
+            "          }",
+            "          return step();",
+            "        });",
+            "      }",
+            "      return step();",
+            "    }).catch(function (error) {",
+            "      notify('保存失败：' + (error && error.message ? error.message : error));",
+            "      return false;",
+            "    });",
+            "  }",
+            "  window.__vvSaveUrl = saveUrl;",
+            "",
+            "  var nativeClick = HTMLAnchorElement.prototype.click;",
+            "  HTMLAnchorElement.prototype.click = function () {",
+            "    try {",
+            "      var downloadName = this.download;",
+            "      var rawHref = this.getAttribute('href') || '';",
+            "      if (downloadName && (rawHref.indexOf('blob:') === 0 || rawHref.indexOf('data:') === 0)) {",
+            "        saveUrl(this.href, downloadName);",
+            "        return;",
+            "      }",
+            "    } catch (e) { }",
+            "    return nativeClick.apply(this, arguments);",
+            "  };",
+            "})();");
+}
