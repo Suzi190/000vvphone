@@ -94,6 +94,12 @@ public class MainActivity extends Activity {
     /** 键盘收起时的容器高度（= 真全屏高度），用来识别「系统自己 resize 了窗口」的 ROM。 */
     private int fullRootHeight;
 
+    /** 已经放弃 edge-to-edge、把键盘避让交还给系统（fitsSystemWindows + adjustResize）。 */
+    private boolean systemResizeFallback;
+
+    /** 最近一次系统栏（状态栏/导航栏）底边 inset，只为诊断信息。 */
+    private int lastSystemBarBottom;
+
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     /** 把「最终」键盘高度推给页面（中间帧一律不推，见 onImeInsetChanged 里的说明）。 */
@@ -440,6 +446,10 @@ public class MainActivity extends Activity {
      * 所以这里先 getDecorView() 强制安装 decor，并整段兜住 Throwable。
      */
     private void applyImmersiveMode() {
+        if (systemResizeFallback) {
+            // 已经交还给系统避让：这时候再把系统栏藏起来，adjustResize 算出来的可用高度就是错的
+            return;
+        }
         Window window = getWindow();
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -536,7 +546,14 @@ public class MainActivity extends Activity {
     private void applyWindowInsets(View root) {
         root.setOnApplyWindowInsetsListener((v, insets) -> {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                if (systemResizeFallback) {
+                    // 系统自己 resize 窗口，页面 100vh 会跟着变小，这里什么都别做
+                    // （尤其不能返回 CONSUMED，否则 WebView 拿不到键盘 inset，自己也滚不动）
+                    latestKeyboardBottom = 0;
+                    return insets;
+                }
                 int bottom = insets.getInsets(WindowInsets.Type.ime()).bottom;
+                lastSystemBarBottom = insets.getInsets(WindowInsets.Type.systemBars()).bottom;
                 if (bottom > 0) {
                     // 兜底校正：个别 ROM 的 ime inset 偏小（不含键盘工具栏），
                     // 这时用「窗口可见区域底边距」补一次；差值不到 24dp 就不动，避免来回抖。
@@ -953,11 +970,89 @@ public class MainActivity extends Activity {
          */
         @JavascriptInterface
         public int getKeyboardHeight() {
+            if (systemResizeFallback) {
+                // 已经交给系统缩窗口，页面再叠一层内边距就是双重避让
+                return 0;
+            }
             int cssPx = currentKeyboardCssPx();
             if (cssPx == 0) {
                 cssPx = measureKeyboardGapCssPx();
             }
             return cssPx;
+        }
+
+        /**
+         * 交还给系统避让：关掉 edge-to-edge、恢复系统栏、让 FrameLayout 自己吃 insets，
+         * 于是 {@code adjustResize} 真正生效，WebView 被系统缩小，输入框自然露出来。
+         *
+         * 这是「所有测量手段都拿不到键盘高度」时的最后一道保险：会牺牲沉浸式（状态栏/导航栏
+         * 重新占位），但至少能正常打字——比输入框被键盘盖住强。
+         */
+        @JavascriptInterface
+        public void fallbackToSystemResize() {
+            mainHandler.post(() -> {
+                if (systemResizeFallback) {
+                    return;
+                }
+                systemResizeFallback = true;
+                // 之前算出来的让位值全部作废：接下来由系统缩窗口，页面不能再叠一层 padding
+                latestKeyboardBottom = 0;
+                appliedBottomInset = 0;
+                pushedKeyboardBottom = 0;
+                pushKeyboardHeight(0);
+                try {
+                    Window window = getWindow();
+                    window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        window.setDecorFitsSystemWindows(true);
+                        WindowInsetsController controller = window.getInsetsController();
+                        if (controller != null) {
+                            controller.show(WindowInsets.Type.statusBars()
+                                    | WindowInsets.Type.navigationBars());
+                            controller.setSystemBarsBehavior(
+                                    WindowInsetsController.BEHAVIOR_DEFAULT);
+                        }
+                    } else {
+                        window.getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+                    }
+                    if (contentHost != null) {
+                        // fitsSystemWindows 的 View 会自己把 insets 变成 padding，
+                        // 于是 WebView 真的变矮，页面 100vh 跟着键盘走。
+                        // 必须先摘掉我们自己的 listener，否则它会盖住 View 的默认实现。
+                        contentHost.setOnApplyWindowInsetsListener(null);
+                        contentHost.setFitsSystemWindows(true);
+                        contentHost.requestApplyInsets();
+                    }
+                    Log.i(TAG, "键盘高度测量失败，已降级为系统 resize 避让");
+                } catch (Throwable error) {
+                    Log.w(TAG, "降级为系统 resize 避让失败", error);
+                }
+            });
+        }
+
+        /** 反馈到页面上的诊断串（同步读取，不依赖任何推送）。 */
+        @JavascriptInterface
+        public String getDiag() {
+            float density = getResources().getDisplayMetrics().density;
+            return "ver=" + appVersionName()
+                    + " api=" + Build.VERSION.SDK_INT
+                    + " d=" + String.format(java.util.Locale.US, "%.2f", density)
+                    + " ime=" + latestKeyboardBottom
+                    + " sb=" + lastSystemBarBottom
+                    + " gap=" + measureKeyboardGapPx()
+                    + " rootH=" + (contentHost == null ? -1 : contentHost.getHeight())
+                    + " fullH=" + fullRootHeight
+                    + " css=" + currentKeyboardCssPx()
+                    + " fb=" + (systemResizeFallback ? "on" : "off");
+        }
+    }
+
+    private String appVersionName() {
+        try {
+            PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), 0);
+            return info.versionName + "/" + info.versionCode;
+        } catch (Throwable error) {
+            return "unknown";
         }
     }
     private File resolveLegacyDownloadDir() {
